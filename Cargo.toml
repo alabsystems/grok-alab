@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+
+# The tool atpkg lays on PATH when this program is packed (a Plain program:
+# `bin/grok-alab`). Never `grok`: that name is the vendor row's own shim.
+[workspace.metadata.atpkg]
+expose = ["grok-alab"]
+
+[package]
+name = "grok-alab"
+description = "The Grok Build harness for aterm: runs xAI's unmodified grok from aterm's package store as its child and moves it onto a newer build at a safe point"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "grok-alab"
+path = "src/main.rs"
+
+[lib]
+name = "grok_alab"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2.186"
+# errno's safe get/set of the thread's errno, for the signal handler that must leave the
+# interrupted code's errno as it found it (signals.rs).
+errno = "0.3.14"
+# rustix's safe tcgetattr/tcsetattr/tcgetpgrp/getpgrp, for the terminal modes put back after a
+# child ends (supervise.rs `Modes`): libc's termios needs a zeroed struct the verified lane
+# refuses.
+rustix = { version = "1.1.5", features = ["termios", "process"] }
+# nix's safe User::from_uid (getpwuid_r(3)), for the account's home when HOME is unset, empty or
+# not absolute (store.rs `account_home`): libc's needs a zeroed passwd and two unsafe blocks the
+# verified lane refuses, and std::env::home_dir reads the password database only when HOME is
+# unset or empty (a relative HOME it hands back as it is).
+nix = { version = "0.31.3", default-features = false, features = ["user"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

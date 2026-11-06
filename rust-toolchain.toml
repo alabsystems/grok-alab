@@ -1,0 +1,5 @@
+# Pin the Trust toolchain (`targo --unverified <verb>`, `targo trust <verb>`,
+# `targo tippy`, `targo fmt`). atpkg installs it with aterm; `aterm pkg which
+# targo` names the store build that answers. The public snapshot keeps this pin.
+[toolchain]
+channel = "trust"

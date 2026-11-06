@@ -1,0 +1,10 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# Gitleaks configuration for the published grok-alab tree: the standard rule set and
+# nothing else. NO ALLOWLIST, deliberately: the publication engine refuses every
+# repository-controlled suppression. If Gitleaks flags something real, fix it where it
+# lives.
+
+[extend]
+useDefault = true

@@ -1,0 +1,14 @@
+grok-alab
+Copyright 2026 Andrew Yates
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+grok-alab runs xAI's Grok Build command-line program (`grok`) as a separate process. It
+does not include, modify or redistribute any part of that program; `grok` is installed and
+licensed separately, by xAI's terms, through aterm's package manager. Grok and Grok Build
+are names of xAI.
+
+Parts of grok-alab follow aterm's source (Apache-2.0, the same author): the package store
+layout and build numbering of its package manager (crates/atpkg), and the per-vendor resume
+grammar of its relaunch lanes (crates/aterm-agent/src/harness/relaunch.rs, lanes.rs). The
+file and function each comes from is cited where it is used.
