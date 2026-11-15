@@ -305,3 +305,52 @@ fn read_bounded_refuses_oversized_and_non_regular_files() {
     assert_eq!(read_bounded(&fifo, 16), None);
     assert_eq!(read_sidecar(&fifo, 16), None);
 }
+
+/// atpkg's `lock::read_holder` and `holder_is_person`: a person's command holds the store only
+/// when its record says `person=1` and its pid is alive; a record with either line missing, a
+/// pid that is not all digits, or a symlink says no one.
+#[test]
+fn the_holder_record_names_a_person_only_while_its_pid_lives() {
+    assert_eq!(holder("pid=42\nperson=1\n"), Some((42, true)));
+    assert_eq!(holder("person=0\npid= 7 \n"), Some((7, false)));
+    assert_eq!(
+        holder("pid=42\npid=x\nperson=1\n"),
+        None,
+        "the last pid decides"
+    );
+    for bad in [
+        "",
+        "pid=42\n",
+        "person=1\n",
+        "pid=-1\nperson=1\n",
+        "pid=\nperson=1\n",
+    ] {
+        assert_eq!(holder(bad), None, "{bad:?}");
+    }
+    let dir = crate::scratch::Scratch::new("holder");
+    let layout = Layout {
+        prefix: dir.to_path_buf(),
+    };
+    assert!(!holder_is_person(&layout), "no record, no holder");
+    let record = dir.join(HOLDER);
+    let me = std::process::id();
+    std::fs::write(&record, format!("pid={me}\nperson=1\n")).unwrap();
+    assert!(holder_is_person(&layout));
+    std::fs::write(&record, format!("pid={me}\nperson=0\n")).unwrap();
+    assert!(!holder_is_person(&layout), "a background update's hold");
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    std::fs::write(&record, format!("pid={dead}\nperson=1\n")).unwrap();
+    assert!(!holder_is_person(&layout), "a holder that is gone");
+    std::fs::write(&record, "pid=1\nperson=1\n").unwrap();
+    assert!(
+        holder_is_person(&layout),
+        "a live pid this process may not signal"
+    );
+    let real = dir.join("real");
+    std::fs::write(&real, format!("pid={me}\nperson=1\n")).unwrap();
+    std::fs::remove_file(&record).unwrap();
+    std::os::unix::fs::symlink(&real, &record).unwrap();
+    assert!(!holder_is_person(&layout), "a symlinked record");
+}

@@ -14,23 +14,28 @@
 //! child's own status.
 //!
 //! Under aterm it holds the session through `alab-wire`, the aterm client every ALab harness
-//! shares ([`aterm`]): it claims `relaunch,upgrade` at aterm's harness contract 4 (or 3 where
-//! aterm serves no 4), names each child it starts (`child=<pid>:<start>`), follows aterm's
+//! shares ([`aterm`]): it claims `relaunch,upgrade` under aterm's harness contract 4 only
+//! ([`aterm::CONTRACTS`]), names each child it starts (`child=<pid>:<start>`), follows aterm's
 //! harness policy on its event (giving the claim back while it is off), relaunches a crashed
 //! child on the same session on aterm's word and back-off, makes the restarts aterm asks for
 //! (`restart cause=asked|stall`, on another model when it names one), and takes the safe point
 //! from aterm's read of the screen, a read that cannot pass on today's aterm (it reports
 //! `agent=unknown` for every Grok session), so moves there still wait for `SIGUSR1`. It never
 //! starts a grok that would start signed out itself ([`credentials`]). Where aterm refuses the
-//! claim, it execs grok in its own place and is gone ([`run`]).
+//! claim, or serves no contract 4, it execs grok in its own place and is gone ([`run`]); no
+//! claim at contract 3 is ever sent, at the launch or later (Decision 61).
 //!
 //! Its command line is `grok-alab --version`, and `grok-alab run [--] [grok arguments…]` (what
 //! aterm's `grok` twin runs); `grok-alab [grok arguments…]` is `run` too. Arguments after `run`
 //! are grok's, never the harness's own.
 //!
-//! Under aterm, a signed-out interactive launch first asks aterm to sign the machine in once
-//! ([`signin`]), before it claims or passes through: either would start a grok that opens a
-//! browser page of its own.
+//! Before any of that, `run` does what aterm's `grok` launcher did before it handed the words
+//! on, in the launcher's order (aterm `docs/DESIGN-harness-interface-2026-11-12.md` §2.1, "The
+//! launcher keeps its other duties"): `grok update` runs `aterm pkg update grok`
+//! ([`selfupdate`]); under aterm, a signed-out interactive launch first asks aterm to sign the
+//! machine in once ([`signin`]), since any grok started signed out opens a browser page of its
+//! own; and a launch that names no permission posture gets Grok Build's `--always-approve`
+//! ([`yolo`]). The vendor runs with the build's shim environment ([`store::shim_env`]).
 
 pub mod aterm;
 pub mod credentials;
@@ -41,11 +46,13 @@ pub mod procs;
 pub mod safepoint;
 #[cfg(test)]
 mod scratch;
+pub mod selfupdate;
 pub mod session_id;
 pub mod signals;
 pub mod signin;
 pub mod store;
 pub mod supervise;
+pub mod yolo;
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -312,6 +319,21 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
             return exit_status(126);
         }
     };
+    // THE LAUNCHER'S BLOCKS, in its order, on the launch as typed (aterm's interface design
+    // §2.1). First the self-update intercept: `grok update` is aterm's package manager's.
+    let help = match selfupdate::intercept(&args) {
+        selfupdate::Intercept::Pass => false,
+        selfupdate::Intercept::Help => {
+            eprintln!("{}", selfupdate::HELP_LINE);
+            true
+        }
+        selfupdate::Intercept::Declined(line) => {
+            eprintln!("{line}");
+            journal.line("REFUSED", &line);
+            return exit_status(2);
+        }
+        selfupdate::Intercept::Update => return update(&layout, env, &journal),
+    };
     let build = match store::current(&layout) {
         Ok(b) => b,
         Err(missing) => {
@@ -329,19 +351,50 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
         journal.line("REFUSED", &why);
         return exit_status(126);
     }
-    let plan = lanes::plan(&args, session_id::new_v4());
-    if lanes::command(&plan) == Some(lanes::SELF_UPDATE_COMMAND) {
+    if help {
+        // The launcher hands help to its shim, whose yolo block drops `--no-harness` ahead of a
+        // literal `--` and exports `ATERM_NO_HARNESS=1` for it: grok's parser knows no such word.
+        let stripped = yolo::strip_no_harness(&args);
+        let left_out = stripped.is_some();
+        return pass_through(
+            &layout,
+            &build,
+            stripped.as_deref().unwrap_or(&args),
+            depth,
+            &journal,
+            "`grok update --help` is grok's own help",
+            left_out,
+        );
+    }
+    // What grok will be given: the words less `--no-harness`, which leaves the harness out
+    // (Decision 63), with the yolo block's flag (Decision 59). Decided now and printed only once
+    // the launch is known to run.
+    let stripped = yolo::strip_no_harness(&args);
+    let left_out = stripped.is_some();
+    let words = stripped.unwrap_or_else(|| args.clone());
+    let launch = match yolo::decide(&words) {
+        // `--no-harness` asks for the vendor alone: no default posture, though a typed `--yolo`
+        // is still the flag it names.
+        yolo::Launch::Default(_) if left_out => yolo::Launch::AsTyped,
+        launch => launch,
+    };
+    let echo = launch.echo_prefix();
+    let words = launch.words(words);
+    // `update` wherever else clap reads it as the subcommand (after root options or the prompt)
+    // would run grok's own updater (Decision 5).
+    if lanes::command(&lanes::plan(&words, None)) == Some(lanes::SELF_UPDATE_COMMAND) {
         let why = "`grok update` would replace the build aterm's package manager verified; \
                    run `aterm pkg update grok` instead";
         eprintln!("{NAME}: {why}");
         journal.line("REFUSED", why);
         return exit_status(2);
     }
-    // Under aterm, a signed-out interactive launch is signed in once for the machine first
-    // (Decision 26): the vendor's own sign-in would open a browser page per launch.
+    // The sign-in gate, on the launch as typed: under aterm, a signed-out interactive launch is
+    // signed in once for the machine first (Decisions 26, 62), since the vendor's own sign-in
+    // would open a browser page per launch.
     let shim = store::shim_env(&layout, &build);
     let vendor_env = credentials::child_env(&shim, env);
-    match signin::decide(signin::gated(&plan), &vendor_env, &mut signin::run_signin) {
+    match signin::decide(signin::gated(&args), &vendor_env, &mut signin::run_signin) {
         signin::Gate::Pass => {}
         signin::Gate::SignedIn => journal.line(
             "NOTE",
@@ -353,10 +406,28 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
             return exit_status(signin::EXIT_SIGNED_OUT);
         }
     }
+    // The yolo block's line, as the launcher printed it: what grok runs with.
+    if let Some(prefix) = echo {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(&yolo::echo_line(prefix, &words));
+    }
+    let args = words;
+    if left_out {
+        return pass_through(
+            &layout,
+            &build,
+            &args,
+            depth,
+            &journal,
+            "`--no-harness` leaves the harness out",
+            true,
+        );
+    }
+    let plan = lanes::plan(&args, session_id::new_v4());
     let link = if aterm::hosted(env) {
         match under_aterm(env, &plan, &build, &journal) {
             Ok(link) => link,
-            Err(why) => return pass_through(&layout, &build, &args, depth, &journal, &why),
+            Err(why) => return pass_through(&layout, &build, &args, depth, &journal, &why, false),
         }
     } else {
         alab_wire::Link::absent(aterm::config(), std::process::id())
@@ -385,12 +456,13 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
 /// Under aterm: the launch's claim, made through `alab-wire` before grok starts (aterm's
 /// harness design §3.2), to a link grok then runs under, or the reason to pass through. The
 /// person's `ATERM_NO_HARNESS=1` and a launch the harness cannot carry pass through without a
-/// word to aterm. A claim aterm refused (a refused or unproven claim, an unrostered harness
-/// under contract 3, a policy off by a fact of the window), and one granted less than both of
-/// [`aterm::SCOPES`] (released first, Decision 44), pass through. A claim aterm could not make
-/// now (it answered later or late, it serves no contract this harness speaks, its policy is
-/// switched off) keeps grok the harness's child, unclaimed, and the claim is made again every
-/// 5 s (Decisions 35, 45). The link's notes are journaled.
+/// word to aterm. A claim aterm refused (a refused or unproven claim, a policy off by a fact of
+/// the window), one granted less than both of [`aterm::SCOPES`] (released first, Decision 44),
+/// and a policy that lists none of [`aterm::CONTRACTS`] (`alab-wire`'s `Failure::Unserved`,
+/// with nothing claimed, Decision 61) pass through. A claim aterm could not make now (it
+/// answered later or late, its policy is switched off) keeps grok the harness's child,
+/// unclaimed, and the claim is made again every 5 s (Decisions 35, 45). The link's notes are
+/// journaled.
 ///
 /// # Errors
 /// Why the harness gets out of the way.
@@ -429,6 +501,11 @@ pub fn under_aterm(
             last.as_deref().unwrap_or("no session to claim")
         ));
     }
+    if let Some(alab_wire::Failure::Unserved(why)) = link.unclaimed() {
+        return Err(format!(
+            "aterm serves no contract this build claims under ({why}); nothing was claimed"
+        ));
+    }
     if link.judges() && !aterm::takes_both(&link) {
         let granted = aterm::granted(&link);
         link.release(aterm::now_ms());
@@ -448,9 +525,65 @@ pub fn under_aterm(
     Ok(link)
 }
 
+/// `grok update`: `aterm pkg update grok --wait-lock 1800` as this process's child, as atpkg's
+/// `selfupdate_check` runs it once the launcher hands it the launch (Decision 60): atpkg's
+/// announcement naming the build that runs now, the update started with
+/// [`selfupdate::SPAWNER_PID_ENV`] naming this process and waited for, and the launch's status
+/// and line after it from [`selfupdate::settle`]. Without an `aterm` on an absolute `PATH` entry
+/// the update is refused, exit 2, never handed to grok's own updater; one that cannot be
+/// started is 126.
+#[must_use]
+pub fn update(layout: &store::Layout, env: &Env, journal: &journal::Journal) -> libc::c_int {
+    use std::io::Write as _;
+    let Some(aterm) = signin::find_aterm(env) else {
+        let why = "`grok update` runs `aterm pkg update grok`, and no aterm is on PATH; grok's \
+                   own updater would replace the build aterm's package manager verified";
+        eprintln!("{NAME}: {why}");
+        journal.line("REFUSED", why);
+        return exit_status(2);
+    };
+    let installed = || match store::current(layout) {
+        Ok(build) => build.version_label(),
+        Err(_) => "(no version recorded)".to_string(),
+    };
+    eprintln!("{}", selfupdate::announce_line(&installed()));
+    let _ = std::io::stderr().flush();
+    let args = selfupdate::child_args();
+    let ran = format!("{} {}", aterm.display(), args.join(" "));
+    journal.line(
+        "PASS",
+        &format!("`grok update` runs `{ran}` as the harness's child"),
+    );
+    let status = std::process::Command::new(&aterm)
+        .args(&args)
+        .env(selfupdate::SPAWNER_PID_ENV, std::process::id().to_string())
+        .spawn()
+        .and_then(|mut child| child.wait());
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("{}", selfupdate::could_not_run_line(&aterm, &e));
+            journal.line("REFUSED", &format!("cannot run {ran}: {e}"));
+            return exit_status(126);
+        }
+    };
+    let (code, line) =
+        selfupdate::settle(status.code(), installed, || store::holder_is_person(layout));
+    if let Some(line) = &line {
+        eprintln!("{line}");
+    }
+    journal.line(
+        "EXIT",
+        &format!("`grok update` exits {code}: `{ran}` ended with {status}"),
+    );
+    exit_status(code)
+}
+
 /// Exec grok in this process's place with the launch's own arguments and the build's shim
-/// environment: the tab then runs grok under its own name, as if no harness existed. Returns
-/// only when the exec failed (127 when grok is missing, else 126).
+/// environment: the tab then runs grok under its own name, as if no harness existed. A launch
+/// that typed `--no-harness` (`left_out`) also exports `ATERM_NO_HARNESS=1`, as aterm's launcher
+/// exports it for the vendor. Returns only when the exec failed (127 when grok is missing, else
+/// 126).
 #[must_use]
 pub fn pass_through(
     layout: &store::Layout,
@@ -459,6 +592,7 @@ pub fn pass_through(
     depth: u32,
     journal: &journal::Journal,
     why: &str,
+    left_out: bool,
 ) -> libc::c_int {
     use std::os::unix::process::CommandExt;
     journal.line(
@@ -472,6 +606,9 @@ pub fn pass_through(
     cmd.args(args);
     for (name, value) in store::shim_env(layout, build) {
         cmd.env(name, value);
+    }
+    if left_out {
+        cmd.env(aterm::NO_HARNESS_ENV, "1");
     }
     // No harness pid: grok is not this harness's child. The depth still counts, so a store
     // entry that leads back here stops at MAX_DEPTH.

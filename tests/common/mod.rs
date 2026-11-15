@@ -26,8 +26,8 @@ pub const fn vendor_id(x: u64, y: u64, z: u64) -> u64 {
     1_000_000_000_000_000_000 + x * 1_000_000_000_000 + y * 1_000_000 + z
 }
 
-/// The fake grok: logs its start (build, pid, the env the harness sets, every argument) to
-/// `$FAKE_GROK_LOG`, logs and exits 0 on TERM or HUP (as Grok Build 1.0.70 does, MEASURED),
+/// The fake grok: logs its start (build, pid, the env the harness sets, each variable
+/// `$FAKE_GROK_SHOW` names, every argument) to `$FAKE_GROK_LOG`, logs and exits 0 on TERM or HUP (as Grok Build 1.0.70 does, MEASURED),
 /// logs INT, reads one typed line from its terminal on USR2, and then behaves as
 /// `$FAKE_GROK_MODE_<build id>` says, else `$FAKE_GROK_MODE` (so one build can refuse to start
 /// while another runs).
@@ -70,7 +70,9 @@ case "$mode" in
   term-once) trap 'printf "term-ignored build=@BUILD@\n" >> "$log"; trap on_term TERM' TERM ;;
   held-term) trap 'printf "term-held build=@BUILD@\n" >> "$log"; held=1' TERM ;;
 esac
-printf 'start build=@BUILD@ pid=%s autoupdater=%s harness=%s depth=%s argv=' "$$" "${GROK_DISABLE_AUTOUPDATER-}" "${GROK_ALAB_PID-}" "${GROK_ALAB_DEPTH-}" >> "$log"
+shown=
+for v in ${FAKE_GROK_SHOW-}; do shown="$shown$v=${!v-};"; done
+printf 'start build=@BUILD@ pid=%s autoupdater=%s harness=%s depth=%s show=%s argv=' "$$" "${GROK_DISABLE_AUTOUPDATER-}" "${GROK_ALAB_PID-}" "${GROK_ALAB_DEPTH-}" "$shown" >> "$log"
 for a in "$@"; do printf '[%s]' "$a" >> "$log"; done
 printf '\n' >> "$log"
 case "$mode" in
@@ -213,6 +215,28 @@ impl Rig {
         fs::rename(&tmp, pd.join("current")).unwrap();
     }
 
+    /// Lay a fake `aterm` on the rig's `PATH` that records each call's words, one line each,
+    /// and the `ATPKG_SPAWNER_PID` it was given (empty when none), one line each in
+    /// `aterm.calls.spawner` beside the calls file, and exits `$FAKE_ATERM_EXIT` (default 0;
+    /// `kill` dies by `SIGKILL`); returns the calls file.
+    pub fn fake_aterm(&self) -> PathBuf {
+        let calls = self.root.join("aterm.calls");
+        let bin = self.path_dir.join("aterm");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{c}'\n\
+                 printf '%s\\n' \"${{ATPKG_SPAWNER_PID-}}\" >> '{c}.spawner'\n\
+                 [ \"${{FAKE_ATERM_EXIT-}}\" = kill ] && kill -KILL $$\n\
+                 exit \"${{FAKE_ATERM_EXIT:-0}}\"\n",
+                c = calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        calls
+    }
+
     /// Let a `held-term` fake honour the TERM it holds (on its next idle tick).
     pub fn release_term(&self) {
         fs::write(format!("{}.release", self.log.display()), "").unwrap();
@@ -265,6 +289,8 @@ pub struct Start {
     pub autoupdater: String,
     pub harness: String,
     pub depth: String,
+    /// `NAME=VALUE;` for each variable `$FAKE_GROK_SHOW` named (`NAME=;` when it is unset).
+    pub show: String,
     pub argv: Vec<String>,
 }
 
@@ -292,6 +318,7 @@ impl Start {
             autoupdater: field("autoupdater").unwrap_or_default(),
             harness: field("harness").unwrap_or_default(),
             depth: field("depth").unwrap_or_default(),
+            show: field("show").unwrap_or_default(),
             argv,
         })
     }

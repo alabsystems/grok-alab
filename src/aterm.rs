@@ -2,13 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! grok-alab's side of its link to aterm. The link itself is the shared library `alab-wire`
-//! (`vendor/alab-harness/crates/alab-wire`, the pinned alab-harness v0.1.0 copy): the wire, the
-//! claim at contract 4 or 3 with its guards (the roster under contract 3, the scope read back),
-//! the [`Link`] state machine (held, lost and claimed again, given back while the policy is off,
-//! the policy followed on its event), aterm's safe-point and relaunch judgements, and the crash
+//! (`vendor/alab-harness/crates/alab-wire`, the pinned alab-harness v0.7.1 copy): the wire, the
+//! claim under the contracts this harness declares with its guards (the scope read back), the
+//! [`Link`] state machine (held, lost and claimed again, given back while the policy is off, the
+//! policy followed on its event), aterm's safe-point and relaunch judgements, and the crash
 //! ladder. This module holds only what is this harness's own:
 //!
-//! - who it is to aterm ([`config`]: `grok-alab` running `grok`, claiming [`SCOPES`]);
+//! - who it is to aterm ([`config`]: `grok-alab` running `grok`, claiming [`SCOPES`] under
+//!   [`CONTRACTS`] alone);
 //! - whether a launch is inside aterm ([`hosted`]) and leaves the harness out ([`left_out`]);
 //! - the clock its link runs on ([`now_ms`], which stops while the machine sleeps);
 //! - what it claims for a child ([`child`], [`process_of`]);
@@ -21,7 +22,7 @@
 
 use std::ffi::OsString;
 
-use alab_wire::{Child, ChildProcess, Config, Facts, Link, SafePoint, Scope, Warrant};
+use alab_wire::{Child, ChildProcess, Config, Contract, Facts, Link, SafePoint, Scope, Warrant};
 
 use crate::env::Env;
 use crate::journal::Journal;
@@ -37,19 +38,37 @@ pub const VENDOR_WORD: &str = "grok";
 /// grok build (`upgrade`). The typing scopes stay unclaimed: this harness types nothing.
 pub const SCOPES: [Scope; 2] = [Scope::Relaunch, Scope::Upgrade];
 
+/// The contracts this build claims under, declared to `alab-wire` ([`config`],
+/// `Config::with_contracts`): `contracts` in `alab-harness.toml`, the record aterm's registry
+/// reads (a unit test holds the record, this list and the config's equal). Only contract 4: a
+/// build that carries a record never claims 3 (aterm's interface design §2.2: contract 3 is the
+/// compiled seed rows' alone, and aterm stops serving a contract only once every installed
+/// build's record claims a newer one), so a 3 here would keep contract 3 served (Decision 61).
+/// `alab-wire` makes every claim (the launch's, each one made again after a loss or a policy
+/// switched back on) under these alone, and none while aterm's policy lists none of them
+/// (`Failure::Unserved`).
+pub const CONTRACTS: [Contract; 1] = [Contract::Four];
+
 /// The variable that leaves the harness out of a session (`--no-alab-harness` on the twin).
 pub const NO_HARNESS_ENV: &str = "ATERM_NO_HARNESS";
 
-/// Who this harness is to aterm.
+/// Who this harness is to aterm, declaring [`CONTRACTS`]. The session stream `alab-wire` opens
+/// on a contract-4 grant from v0.4.0 is not asked for (`Config::with_stream(false)`): the claim
+/// is held on the v0.1 path, renewed on its connection and woken by the event subscription,
+/// until this harness takes the stream (aterm tracker HX-19; Decision 64).
 ///
 /// # Panics
-/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] is not empty, and the
-/// build refuses a [`crate::VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
+/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] and [`CONTRACTS`] are
+/// not empty, and the build refuses a [`crate::VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
 /// ([`crate::is_pack_version`]), which is a claim's `version=`. A unit test makes this config.
 #[must_use]
 pub fn config() -> Config {
     Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::VERSION)
-        .expect("grok-alab's id, vendor word, scopes and version are a config aterm reads")
+        .and_then(|config| config.with_contracts(&CONTRACTS))
+        .expect(
+            "grok-alab's id, vendor word, scopes, version and contracts are a config aterm reads",
+        )
+        .with_stream(false)
 }
 
 /// `env` as the lookup `alab-wire` reads a session from.
@@ -186,6 +205,10 @@ mod tests {
         assert_eq!(config.scopes(), [Scope::Relaunch, Scope::Upgrade]);
         assert_eq!(config.version(), crate::VERSION);
         assert_eq!(config.holder(77), "grok-alab@77");
+        assert!(
+            !config.streams(),
+            "the session stream is not asked for (HX-19)"
+        );
     }
 
     #[test]
@@ -233,6 +256,71 @@ mod tests {
         assert!(link.is_absent() && !link.claims() && !link.judges());
         assert!(!takes_both(&link));
         assert_eq!(granted(&link), "-");
+    }
+
+    /// The record says what the code claims under: `contracts` in `alab-harness.toml` is
+    /// [`CONTRACTS`], which is what the config declares to `alab-wire`, and contract 3 is not
+    /// among them.
+    #[test]
+    fn the_record_lists_the_contracts_this_build_claims_under() {
+        let record = include_str!("../alab-harness.toml");
+        let line = record
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("contracts"))
+            .expect("alab-harness.toml names its contracts");
+        let list = line
+            .split('#')
+            .next()
+            .and_then(|l| l.trim().strip_prefix('='))
+            .map(str::trim)
+            .and_then(|l| l.strip_prefix('['))
+            .and_then(|l| l.strip_suffix(']'))
+            .expect("contracts = [<n>, …]");
+        let numbers: Vec<u32> = list
+            .split(',')
+            .map(|n| n.trim().parse().expect("a contract number"))
+            .collect();
+        assert_eq!(numbers, CONTRACTS.map(Contract::number));
+        assert_eq!(config().contracts(), CONTRACTS);
+        assert!(!config().contracts().contains(&Contract::Three));
+    }
+
+    /// Against an aterm that serves no contract 4 (`2,3`, and contract 2 alone) the launch sends
+    /// nothing after the policy read: no roster read and no claim at 3. The link is lost with
+    /// aterm's answer, `Failure::Unserved`, which [`crate::under_aterm`] passes grok through on.
+    #[test]
+    fn against_an_aterm_without_contract_4_the_launch_claims_nothing() {
+        for served in [&[2, 3][..], &[2]] {
+            let config = config();
+            let fake = alab_wire::fake::FakeAterm::for_harness("grok-unserved", &config);
+            fake.serve_contracts(served);
+            let mut link = Link::launch_with(
+                config,
+                77,
+                child(Some("1.0.70"), None),
+                now_ms(),
+                fake.lookup(&alab_wire::EnvNames::default()),
+            );
+            let words = served
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let why = format!("policy contract={words} declared=4");
+            assert!(
+                link.is_lost() && link.grant().is_none(),
+                "{served:?}: {:?}",
+                link.take_notes()
+            );
+            assert_eq!(
+                link.unclaimed(),
+                Some(&alab_wire::Failure::Unserved(why.clone())),
+                "{served:?}"
+            );
+            assert_eq!(link.take_notes(), [format!("aterm unclaimed {why}")]);
+            assert_eq!(fake.verbs(), ["harness policy"], "{served:?}");
+            assert_eq!(fake.holder(), None, "{served:?}");
+        }
     }
 
     #[test]

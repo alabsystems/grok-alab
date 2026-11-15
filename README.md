@@ -15,8 +15,16 @@ $ grok-alab run -- --model grok-code-fast-1 "fix the failing test"
 The harness's version is its own (`MAJOR.MINOR.0`, `[workspace.package] version` in
 `Cargo.toml`), independent of the vendor's: the line above names both.
 
-Under aterm it holds the session under aterm's **harness contract 4** (contract 3 where aterm
-serves no 4), through `alab-wire`, the aterm client every ALab harness shares: it claims
+Before it runs `grok`, `run` does what aterm's `grok` launcher did before handing the launch
+on, in the launcher's order (aterm's `docs/DESIGN-harness-interface-2026-11-12.md` §2.1, "The
+launcher keeps its other duties"; item 0 below): `grok update` runs `aterm pkg update grok`;
+under aterm a signed-out interactive launch asks aterm to sign the machine in first; a launch
+that names no permission posture gets `--always-approve`, with the launcher's line on stderr;
+and `grok` runs with the build's shim environment. So once the harness leads the `grok` word,
+the launcher only checks that the harness build is live and runs `grok-alab run -- "$@"`.
+
+Under aterm it holds the session under aterm's **harness contract 4**, and only 4 (Decision
+61), through `alab-wire`, the aterm client every ALab harness shares: it claims
 `grok-alab@<pid> contract=4 scope=relaunch,upgrade`, names the `grok` it runs to aterm after
 every start (`child=<pid>:<start>`), follows aterm's harness policy (giving the claim back under
 Autopilot Off), relaunches a `grok` that crashed on the same session on aterm's word and
@@ -24,10 +32,53 @@ back-off, makes the restarts aterm asks for (`restart cause=…`, onto another m
 built to take the safe point for a move from aterm's read of the screen. **That read cannot pass
 on any aterm that ships today**: aterm reports `agent=unknown` for every Grok session (its Grok
 reader is not measured) and no `composer=`, so a move under aterm still waits for `SIGUSR1` or
-the next launch (see "What it does not do (yet)"). An aterm that refuses the claim gets plain
-`grok`: the harness execs it in its own place and is gone.
+the next launch (see "What it does not do (yet)"). An aterm that refuses the claim, or serves
+no contract 4, gets plain `grok`: the harness execs it in its own place and is gone. No claim
+under contract 3 is ever sent: the harness declares contract 4 alone to `alab-wire`
+(`Config::with_contracts`, alab-harness v0.7.1), which keeps every claim to that list.
 
 ## What it does
+
+0. **Carries aterm's launcher blocks, in the launcher's order, on the launch as typed**
+   (Decisions 59 to 63). `grok-alab run -- <words>` is what atpkg's `grok` launcher runs once
+   this harness leads the word (`exec <tool> run -- "$@"`, atpkg `platform/mod.rs`), and the
+   launcher then deletes the blocks below for `grok` (its vendor row's `yolo_*`,
+   `signin_gate` and `self_update_verbs`), so `run` does each of them first, byte for byte where
+   it writes arguments or environment:
+   1. **The self-update intercept.** A first word `update` (exactly as typed, as the launcher's
+      `case "$1"` reads it) is aterm's package manager's, run as atpkg's `__selfupdate` runs
+      it, whether or not a build is current: alone, it prints atpkg's line (`atpkg: aterm
+      updates Grok Build from xAI — you have <version>; checking now: …`), runs `aterm pkg
+      update grok --wait-lock 1800` as its child with `ATPKG_SPAWNER_PID` naming the harness,
+      waits for it, and ends as atpkg ends it: 0 and 2 as they are, 75 after atpkg's line
+      naming who still holds the store, any other status or a signal 1 after atpkg's line
+      saying the build stays. With `-h` or `--help` ahead of a literal `--` it is grok's own
+      help after atpkg's line saying what the verb does here, with `--no-harness` dropped and
+      `ATERM_NO_HARNESS=1` exported as the launcher's shim does for help; anything else after
+      it (`update --check`) is refused, exit 2, with atpkg's line. Each line is atpkg's, byte for byte,
+      `atpkg:` included. With no `aterm` on an absolute `PATH` entry it is refused, exit 2,
+      never handed to grok's own updater (Decision 60).
+   2. **The sign-in gate** (item 9), on the launch as typed, by the launcher's own rule for
+      which launch is gated (Decision 62).
+   3. **The yolo default.** A launch that names no permission posture gets Grok Build's
+      `--always-approve` in front, or right after `agent` when that is its first word; a typed
+      `--yolo` becomes `--always-approve` in place (dropping grok's own alias
+      `--dangerously-skip-permissions` ahead of the first word, which its parser refuses
+      twice); a launch that already names a posture (the vendor row's `yolo_markers`:
+      `--always-approve`, `--permission-mode`, `--sandbox`, `--allow`, `--deny`, the
+      allowed/disallowed tools, in every spelling clap reads), a management subcommand (the
+      row's `yolo_skip`) or `update`, an option the launcher's scan does not know, and a
+      `--yolo` whose removal would hand the next word to an optional value run as typed. Each
+      launch it changes prints the launcher's line on stderr, byte for byte: `aterm: yolo
+      (default): running 'grok' '--always-approve' …` (or `aterm: --yolo: running …`), every
+      word single-quoted (Decision 59).
+   4. **The shim environment** (item 1): the build's `.shim-env` and
+      `GROK_DISABLE_AUTOUPDATER=1`, as the harness's child and in its place.
+
+   `--no-harness` or `--no-alab-harness` ahead of a literal `--` asks for grok alone, as the
+   launcher reads it: the word is dropped, the sign-in gate does not ask, no default posture is
+   added (a typed `--yolo` is still the flag it names), and `grok` runs in the harness's place
+   with `ATERM_NO_HARNESS=1` exported, as the launcher exports it (Decision 63).
 
 1. **Finds `grok` in atpkg's store, and nowhere else.** It runs
    `<prefix>/store/grok/current/bin/grok`, where `<prefix>` is
@@ -70,8 +121,12 @@ the next launch (see "What it does not do (yet)"). An aterm that refuses the cla
    highest contract the policy's `contract=` lists (Decision 44): **contract 4**, `meta set
    supervisor grok-alab@<pid> contract=4 scope=relaunch,upgrade version=<its version>
    vendor=<grok's>`, whose holder aterm proves from its registry row and whose reply states the
-   grant; else **contract 3**, the same line at `contract=3`, sent only when `native-act info`
-   lists `grok-alab:upgrade` among aterm's roster rows (Decision 37). It confirms the claim with
+   grant. This build claims under contract 4 alone (`contracts = [4]`, declared to `alab-wire`
+   with `Config::with_contracts`, Decision 61): against an aterm whose policy lists no 4
+   (`2,3`, or contract 2 alone) it sends nothing after the policy read, no roster read and no
+   claim, and passes through; an aterm that comes back serving no 4 mid-session is not claimed
+   (`UNCLAIMED policy contract=2,3 declared=4`), `grok` runs on unclaimed, and the claim is made
+   under 4 once aterm serves it. It confirms the claim with
    `status` (`supervisor=grok-alab@<pid> supervisor_proven=1`, every granted duty in
    `supervisor_scope=`), subscribes to the session's events, and gives back a grant short of
    `relaunch,upgrade`. aterm proves the claim itself: the claim's connection is the harness's
@@ -81,13 +136,14 @@ the next launch (see "What it does not do (yet)"). An aterm that refuses the cla
    refuses (the person's `--no-alab-harness` on the twin, which sets `ATERM_NO_HARNESS=1`; a
    launch the harness cannot carry; no socket; a policy with no `contract=`; a policy off by a
    fact of the window, `unhosted` or `headless`; an `ERR` that does not ask to be retried, such
-   as an aterm without the verb; no roster row under contract 3; a refused or unconfirmed claim;
-   a refused subscription; a short grant) **execs `grok` in the harness's place**, with the
+   as an aterm without the verb; no contract 4, contract 2 alone included; a refused or
+   unconfirmed claim; a refused subscription; a short grant) **execs `grok` in the harness's
+   place**, with the
    launch's own arguments and the build's shim environment: the tab runs `grok` under its own
    name, exactly as if no harness existed. An aterm that cannot take the claim now (Decision 45:
    it asked to be retried, as it does while it shows a dialog, or did not answer a step within
-   500 ms once its connection was open, Decision 54; it serves only contract 2; the policy is
-   switched off, by Autopilot Off or
+   500 ms once its connection was open, Decision 54; the policy is switched off, by Autopilot
+   Off or
    `[harness] enabled = false`) keeps `grok` the harness's child, unclaimed, and the claim is
    made every 5 s until it stands. Opening a connection to aterm may take 2 s, and every
    exchange on one is bounded at 500 ms, the launch's included (Decision 54); the loop wakes on
@@ -141,9 +197,13 @@ the next launch (see "What it does not do (yet)"). An aterm that refuses the cla
    in a sandbox that stops the vendor's browser open, with one approval need (code and page)
    for every session that waits on it. `grok` starts only once that exits 0; otherwise a first
    start exits 69 with one line, and a relaunch ends as item 8 says, both journaling `REFUSED`.
-   `--help`, `--version`, `-p` and the local subcommands (`login`, `logout`, `mcp`, `doctor`,
-   ...) never ask; `dashboard`, `sessions` and every other subcommand do. Nothing changes
-   outside aterm or under `--no-alab-harness` (`ATERM_NO_HARNESS`).
+   Which launch is gated is the launcher's rule, word for word (Decision 62): a one-shot option
+   (`--help`, `--version`, `-p` and the other one-prompt options, `--print=…` too) never asks,
+   nor does a first word that is a local subcommand (`login`, `logout`, `mcp`, `doctor`, ...) or
+   `update`, read past the option values the launcher skips; an option it does not know is
+   passed over; `dashboard`, `sessions`, every other subcommand and a launch whose first word is
+   the prompt do ask, and so does a launch that reaches a literal `--`. Nothing changes outside
+   aterm or under `--no-harness`/`--no-alab-harness` (typed, or `ATERM_NO_HARNESS`).
 
 ### Signals
 
@@ -233,7 +293,7 @@ The harness writes what it did, one line per event, to
 `$XDG_STATE_HOME/grok-alab/` or `~/.local/state/grok-alab/`), rotated at 1 MiB: `START`,
 `CLAIMED` (the aterm claim), `REANNOUNCED` (the claim announced again with a new `grok`),
 `NARROWED`/`WIDENED`/`REGRANTED` (the grant aterm shows changed), `PASS` (a signal passed on,
-or `grok` exec'd in the harness's place and why), `SEEN` (a newer build), `WAIT` (why aterm's
+`grok` exec'd in the harness's place and why, or `grok update`'s `aterm pkg update grok`), `SEEN` (a newer build), `WAIT` (why aterm's
 read is not yet a safe point), `MOVE`, `RELAUNCHED`, `FAILED` (a new build that would not
 start, and the build the session went back to), `HOLD` (a refused request, and why), `CRASH`
 and `CRASH-WAIT` (a crash relaunch's pause, and aterm not answering it), `RESTART` (a restart
@@ -291,17 +351,20 @@ A value that is not a number in range is ignored and journaled.
   labelled as a measured reader's.
 * It does not read Grok's session files, screen or network, and does not relaunch a child
   the person quit: an exit by code is the session's end.
-* It does not install or update `grok`. `grok-alab update` (Grok's self-update), also
-  after a prompt (`grok-alab "hi" update`, which clap reads as the `update` subcommand), is
-  refused in favour of `aterm pkg update grok`.
+* It does not install or update `grok` itself, and never lets Grok's own updater run.
+  `grok update` runs `aterm pkg update grok` (item 0); `update` after root options or after a
+  prompt (`grok "hi" update`, which clap reads as the `update` subcommand), which the launcher
+  never intercepted, is refused in favour of `aterm pkg update grok` (Decision 5).
 
 ## Next milestone
 
 The session record (`record=`) and the `upgrade@v1`/`relaunch@v1` acts, account moves once
 Grok's sign-in has a per-account seam aterm can name, the harness's own re-exec onto a newer
-`grok-alab` (aterm's design §4.5), what HX-06's measurement against a contract-4 aterm fixes in
-`alab-wire`, taken as alab-harness `v0.1.x` by pinning it again (Decision 57), and, once aterm's
-Grok reader is measured, moves on aterm's read alone.
+`grok-alab` (aterm's design §4.5; `alab_wire::reexec` from alab-harness v0.6.0 is pinned and not
+used), the session stream (HX-19; v0.4.0's client is pinned and kept off, Decision 64), what
+HX-06's measurement against a contract-4 aterm fixes in `alab-wire`, taken as a newer
+alab-harness tag by pinning it again (Decision 57), and, once aterm's Grok reader is measured,
+moves on aterm's read alone.
 
 ## Build and test
 
@@ -314,9 +377,9 @@ targo tippy --locked --workspace --all-targets -- -D warnings
 targo fmt --check
 ```
 
-The build needs nothing beside this repository: `alab-wire` is the alab-harness v0.1.0 copy
+The build needs nothing beside this repository: `alab-wire` is the alab-harness v0.7.1 copy
 vendored at `vendor/alab-harness` (its own workspace, excluded from this one) and pinned by its
-git tree id in `vendor/alab-harness.pin` (Decision 57). `tests/pin.rs` holds the committed copy
+git tree id in `vendor/alab-harness.pin` (Decisions 57 and 64). `tests/pin.rs` holds the committed copy
 to the pinned tree with no change in the working copy; alab-harness's `tools/check-pin
 <checkout>` is the release check, which also holds the pin to alab-harness's tag. To move to a
 newer tag, run alab-harness's `tools/pin <checkout> <tag>`, then `git add -f vendor/alab-harness
@@ -325,37 +388,82 @@ vendor/alab-harness.pin` and commit. The copy is never edited here.
 The integration tests build a fake `grok` (a shell script) into a scratch package store and
 drive the real `grok-alab` binary against it. `tests/aterm.rs` runs it against `alab-wire`'s
 fake aterm control socket (`alab_wire::fake`, its `fake` feature), from the screen aterm sends
-for Grok today. `grok` runs in the harness's place (same pid, shim environment, the launch's
-own argv) for a refused or unconfirmed claim, a headless window, an aterm without the policy
-verb or with no `contract=`, a refused subscription and a grant without `upgrade` (given back),
-and, with no word to aterm, for `ATERM_NO_HARNESS=1`, a subcommand, an uncarried launch and no
-graph entry. `grok` stays the child, unclaimed, and is claimed once aterm can take it for a
-dialog at the policy or at the proof, a launch read answered late, contract 2 only and
-Autopilot Off. The contract-4 claim (exact verbs, no roster read, `child=` once `grok` runs),
-and contract 3's behind the roster guard, with no row, no verb or a short scope passing
-through. A move on aterm's read with no signal, held by a draft, a person typing, an approval
-box and a missing `composer=`, and the claim announced again with the new `vendor=` and
-`child=`; `upgrade_ask` and `upgrade = false` holding it and `SIGUSR1` overriding; a halt and a
-cap without `upgrade` holding aterm's read and `SIGUSR1` alike; the shipping screen never
-moving it while `SIGUSR1` does. A crash relaunched after aterm's 1 s pause and named to aterm,
-and a second crash's 10 s pause ended by a `TERM`; a crash not relaunched outside aterm, with a
-person at the keys, once a fresh read says `relaunch = false` or the policy is off (no event
-needed), or while signed out; a crash relaunch on a machine signed out mid-session (by a
-removed login, or by aterm's refusal marker) asking a fake `aterm` to sign in first (refused:
-the crash's own end and the resume line; signed in: the relaunch follows). The claim given back
-under Autopilot Off and made again, a policy read answered `ERR` owed until it answers, the
-policy going off while a newer build waits; the claim made again after aterm drops every
-connection, and on a fresh connection after a release aterm refuses. A restart aterm asks for
-resuming the session at once, a stall's killing a `grok` deaf to `SIGTERM`, a model restart
-resuming on `--model` (kept for a later crash), an account move refused, a restart refused once
-its wait runs out and one passed over by a crash relaunch. A move that waits while the machine
-is signed out without asking aterm, and `run --` handing every word to `grok`.
-`tests/harness.rs`, outside aterm, on a pseudo-terminal
-where a test needs one: refusal when the vendor is missing or not ready, `--version`, the
+for Grok today. `grok` runs in the harness's place (same pid, shim environment, the launch's own
+argv) for a refused or unconfirmed claim, a headless window, an aterm without the policy verb or
+with no `contract=`, a refused subscription and a contract-4 claim without `upgrade` (given
+back, each case asserting the `meta unset`): granted so in aterm's reply, narrowed by a cap
+between the reply and the `status` read back (aterm's newer revision is the grant), and stored
+short of its reply (the read-back proves no `upgrade`); and, with no word to aterm, for
+`ATERM_NO_HARNESS=1`, a subcommand, an uncarried launch and no graph entry. `grok` stays the
+child, unclaimed, and is claimed once aterm can take it for a dialog at the policy or at the
+proof, a launch read answered late and Autopilot Off. The contract-4 claim (exact verbs, no
+roster read, `child=` once `grok` runs); against an aterm that serves `2,3` (rostering
+`grok-alab`, without its row or without the roster verb) or contract 2 alone, the policy read
+the only verb sent, no claim at 3 and `grok` passing through; and an aterm that comes back
+serving `2,3` mid-session never claimed under 3 on any attempt, `grok` running on unclaimed
+until the claim is made under 4 once aterm serves it. A move on aterm's read with no signal,
+held by a draft, a person typing, an approval box and a missing `composer=`, and the claim
+announced again with the new `vendor=` and `child=`; `upgrade_ask` and `upgrade = false` holding
+it and `SIGUSR1` overriding; a halt and a cap without `upgrade` holding aterm's read and
+`SIGUSR1` alike; the shipping screen never moving it while `SIGUSR1` does. A crash relaunched
+after aterm's 1 s pause and named to aterm, and a second crash's 10 s pause ended by a `TERM`; a
+crash not relaunched outside aterm, with a person at the keys, once a fresh read says `relaunch
+= false` or the policy is off (no event needed), or while signed out; a crash relaunch on a
+machine signed out mid-session (by a removed login, or by aterm's refusal marker) asking a fake
+`aterm` to sign in first (refused: the crash's own end and the resume line; signed in: the
+relaunch follows). The claim given back under Autopilot Off and made again, a policy read
+answered `ERR` owed until it answers, the policy going off while a newer build waits; the claim
+made again after aterm drops every connection, and on a fresh connection after a release aterm
+refuses. A restart aterm asks for resuming the session at once, a stall's killing a `grok` deaf
+to `SIGTERM`, a model restart resuming on `--model` (kept for a later crash), an account move
+refused, a restart refused once its wait runs out and one passed over by a crash relaunch. A
+move that waits while the machine is signed out without asking aterm, and `run --` handing every
+word to `grok`.
+
+`tests/run.rs` holds `run`'s carried launcher blocks, each against the launcher's own
+answers, one test per block:
+
+- `run_sets_the_yolo_default`, 11 launches with no terminal, each grok's argv and the whole of
+  stderr. No words, options before a prompt, and a prompt with a quote in it get
+  `--always-approve` in front; `agent -p hi` gets it after `agent`; a typed `--yolo` becomes it
+  (with `--dangerously-skip-permissions` dropped beside it ahead of `agent`); each prints the
+  launcher's line byte for byte, quotes included. A posture (`--permission-mode plan`,
+  `--dangerously-skip-permissions`), a management word (`sessions list`) and an unknown option
+  run as typed and print nothing. `--no-harness fix it` runs `fix it` in the harness's place
+  with no default. The rest of the block is held elsewhere: the default kept ahead of the
+  `--resume` a relaunch adds by `tests/aterm.rs`'s
+  `a_crashed_grok_is_relaunched_on_aterms_ladder_and_a_term_in_its_pause_ends_it` and
+  `a_restart_aterm_asks_for_resumes_the_session_at_once` (a launch typed `first prompt`
+  relaunched as `--always-approve --resume <id>`); `update` run without it by
+  `run_intercepts_self_update` (`update --help` reaches grok as typed) and by
+  `src/yolo_tests.rs`, which restates every `grok` case of atpkg's `yolo_tests.rs`.
+- `run_gates_a_signed_out_launch`, under aterm on a signed-out machine. A refused sign-in
+  exits 69 with aterm's one line, prints no yolo line and starts nothing; a sign-in that
+  succeeds is followed by the yolo line and the launch. The launcher's rule: `fix it login`,
+  `-r login`, `dashboard` and a literal `--` are gated; `--unknown login`, `-m grok-4
+  doctor`, `fix it -p hi`, `--print=hi` and `--no-harness fix it` are not; outside aterm
+  nothing is asked. `login`, `update` and `--help` alone are held by `src/signin.rs`'s
+  `only_a_one_shot_option_a_local_subcommand_or_no_harness_skips_the_gate`.
+- `run_intercepts_self_update`. `grok update` runs `aterm pkg update grok --wait-lock 1800`
+  as the harness's child with `ATPKG_SPAWNER_PID` naming it, after atpkg's line, and ends as
+  atpkg ends it: 0 and 2 as they are, 75 after the line naming a background update or a
+  person's `aterm pkg` command, 1 and a signal each 1 after atpkg's line, with no build
+  current too. `update --check` is refused with atpkg's line; `update --help` is grok's own
+  help, and `update --no-harness --help` reaches grok as `update --help` with
+  `ATERM_NO_HARNESS=1`; `fix it update` and `update` with no `aterm` on `PATH` are refused
+  and start nothing.
+- `run_sets_the_shim_env`. A build whose `.shim-env` sidecar sets `GROK_SHIM_PROBE=on` and
+  `GROK_DISABLE_AUTOUPDATER=0` runs grok with the probe and the updater switch still `1`, as
+  the harness's child, in its place under `ATERM_NO_HARNESS=1`, and in its place for a launch
+  that typed `--no-harness`, which exports `ATERM_NO_HARNESS=1`. A sidecar that sets `PATH`
+  is refused whole, and the switch stays `1`.
+
+`tests/harness.rs` holds, outside aterm, on a pseudo-terminal where a test needs one: refusal when the vendor is missing or not ready, `--version`, the
 home a relative `HOME` stands for taken from the password database (never the relative one),
 never exec'ing itself (a store entry that is the harness, one that execs it, one that runs
 it as a child, and a newer build or a move target that is the harness), argument
-passthrough and exit status, `grok update` refused alone and after a prompt, a signal death
+passthrough and exit status, `grok update` refused with no `aterm` on `PATH` and after a
+prompt, a signal death
 re-raised, `TERM`/`HUP` passed on, `INT`/`QUIT` left to the child, a `HUP` ignored at start
 left ignored by the harness and its child, `TSTP`/`CONT` followed, a
 move onto a newer build with the resume arguments in the same harness process, a child that
@@ -381,6 +489,60 @@ type-checked and linted for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linu
 -D warnings`), and has never been run.
 
 ## Verification
+
+The v0.7.1 pin (Decision 64), measured 2026-11-14 on this tree with `targo` from the session's
+PATH, against the vendored alab-harness v0.7.1 (tree f336fe1), which changes no library code
+from v0.7.0:
+
+* `targo --unverified test --locked --workspace`: 90 unit and 74 integration tests pass, the
+  counts of the v0.7.0 pin.
+* `targo tippy --locked --workspace --all-targets -- -D warnings`: clean. `targo fmt --check`:
+  clean. alab-harness's `tools/check-pin` on this checkout: `carries v0.7.1 exactly`.
+* The verified lane was not run: no proof claim is made for this tree.
+
+The v0.7.0 pin and the declared contracts (Decisions 61 and 64), measured 2026-11-14 on this
+tree with `targo` from the session's PATH, against the vendored alab-harness v0.7.0 (tree
+e4c1f87):
+
+* `targo --unverified test --locked --workspace`: 90 unit and 74 integration tests pass (35 in
+  `tests/harness.rs`, 34 in `tests/aterm.rs`, 4 in `tests/run.rs`, 1 in `tests/pin.rs`). On
+  the pin alone (stream off, contracts left at `alab-wire`'s default) the 89 unit and 75
+  integration tests of the tree before passed unchanged.
+* With the config declaring `alab-wire`'s default `[3, 4]` in place of `CONTRACTS`, the record
+  test, `against_an_aterm_without_contract_4_the_launch_claims_nothing`,
+  `against_an_aterm_without_contract_4_no_claim_is_sent_and_grok_passes_through` and
+  `an_aterm_that_comes_back_without_contract_4_is_never_claimed_under_3_and_grok_runs_on` fail.
+* `targo tippy --locked --workspace --all-targets -- -D warnings`: clean. `targo fmt --check`:
+  clean. alab-harness's `tools/check-pin` on this checkout: `carries v0.7.0 exactly`.
+* After the review of the same day, the pin commit and the contract commit each pass all four
+  gates on their own trees (the pin no longer leaves a line for `targo fmt` to split), and the
+  counts above stand: the contract-4 read-back cases are cases of an existing test. In a scratch
+  copy, `alab-wire` ignoring a newer revision at the read-back fails the cap case, its proof
+  skipping the scope words fails the stored-short case, and `under_aterm` without its
+  `takes_both` give-back fails the reply's short grant and the cap case.
+* The verified lane was not run: no proof claim is made for this tree.
+
+The launcher's blocks in `run` and contract 4 alone (Decisions 59 to 63), measured
+2026-11-14 on this tree with `targo` from the session's PATH, against the vendored alab-harness
+v0.1.0 and aterm `origin/main` 1dea002b0e5 (whose `crates/atpkg` the ports follow), then again
+after the review of the same day against `origin/main` 3c6c4d79127, in which none of the
+launcher's files the ports cite (`crates/atpkg/src/{cli,selfupdate,yolo,shim_env}.rs`,
+`vendor_direct/table.rs`, `platform/mod.rs`) has changed:
+
+* `targo --unverified test --locked --workspace`: 89 unit and 75 integration tests pass (35 in
+  `tests/harness.rs`, 35 in `tests/aterm.rs`, 4 in `tests/run.rs`, 1 in `tests/pin.rs`).
+  `src/yolo_tests.rs` restates every `grok` case of atpkg's `yolo_tests.rs`.
+* `targo --unverified test --locked -- run_sets_the_yolo_default run_gates_a_signed_out_launch
+  run_intercepts_self_update run_sets_the_shim_env`: only `ok` lines, 4 passed in all.
+* Each of `tests/run.rs`'s four tests, and the two contract-3 tests in `tests/aterm.rs`, fails
+  on main's `src` (no default, no intercept, the old gate rule, a claim held under contract 3);
+  `run_intercepts_self_update` also fails on the review's tree (`b63652e`: no `--wait-lock`, no
+  spawner pid, no closing lines, `--no-harness` handed to grok's help).
+* `targo tippy --locked --workspace --all-targets -- -D warnings`: clean. `targo fmt --check`:
+  clean. alab-harness's `tools/check-pin` on this checkout: `carries v0.1.0 exactly`.
+* The verified lane was not run: no proof claim is made for this tree.
+* Open: the contract-3 claim `alab-wire` v0.1.0 still sends where aterm serves no 4 (closed
+  since by the v0.7.0 pin, Decision 61).
 
 The pinned copy (Decisions 57 and 58), measured 2026-11-14 on this tree with `targo` from the
 session's PATH (targo 0.12.0+g29ebb403d), against the vendored alab-harness v0.1.0 (tree
@@ -581,16 +743,19 @@ Each choice below was made without asking, taking the fail-closed, reversible op
    aterm's vendor row knows. An option outside it makes the launch uncarried, never
    guessed at.
 5. **`grok update` is refused** (exit 2) in favour of `aterm pkg update grok`, wherever
-   clap would read `update` as the subcommand (after root options or after the prompt;
+   clap would read `update` as the subcommand and the launcher's intercept did not (Decision
+   60 runs the first-word `update` the launcher intercepted; this rule covers the rest: after
+   root options or after the prompt;
    clap 4 checks every token that is no option value against the subcommands, and grok's
    one-line usage shows it does not set `args_conflicts_with_subcommands`), and
    `GROK_DISABLE_AUTOUPDATER=1` is always set (aterm's vendor row for `grok`,
    `crates/atpkg/src/vendor_direct/table.rs`): the build that runs is the one atpkg
    verified.
-6. **No default posture is added.** aterm's vendor row for `grok` knows its permission
-   flags (its yolo markers) for aterm's own launcher; the harness adds no permission flag
-   and passes the person's own through. A relaunch keeps every permission flag the launch
-   carried.
+6. **No default posture is added** (superseded by Decision 59 on 2026-11-14: `run` now adds
+   the launcher's default, which the launcher stops adding once the harness leads `grok`).
+   aterm's vendor row for `grok` knows its permission flags (its yolo markers) for aterm's own
+   launcher; the harness added no permission flag and passed the person's own through. A
+   relaunch keeps every permission flag the launch carried, the default included.
 7. **Only a strictly newer build is moved onto.** A rollback of `current` is not acted on
    mid-session. If the target disappears before the relaunch, the session is resumed on
    the newest build still ready, else on the build it ran.
@@ -698,7 +863,8 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     one-shot option (`--help`, `--version`, `-p` and the other one-prompt options) and the
     local subcommands aterm's twin names (`signin::LOCAL_COMMANDS`: local reads and edits, help,
     version, and grok's own `login` and `logout`); `dashboard` opens the interactive screen, so
-    it is gated, as is an unknown word. `ATERM_NO_HARNESS` (the twin's `--no-alab-harness`)
+    it is gated, as is an unknown word. (Decision 62, 2026-11-14: which launch is gated is now
+    read by the launcher's own scan, word for word, on the launch as typed.) `ATERM_NO_HARNESS` (the twin's `--no-alab-harness`)
     takes the gate away with the rest of the harness. aterm's twin runs the same gate first,
     so under it this one finds the machine signed in. It ships in the v0.3.0 line (no v0.3.0
     was tagged before it). Reversible: the gate is one module, one call in `run` and one in
@@ -851,7 +1017,10 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     run on every claim, the loop's included. Tests: three rosters and two short scopes pass
     through, the first three with no `meta set` sent. Reversible: one guard, one check. (Now
     contract 3's only, in `alab-wire`; contract 4 has no roster and proves the holder from its
-    registry row, Decision 44.)
+    registry row, Decision 44. Since Decision 61's v0.7.0 pin this harness never claims under
+    contract 3, so the guard is never reached and no roster read is sent. The scope read back
+    runs under contract 4 too, tested by a cap between the claim and its read-back and by a
+    claim stored short of its reply, each given back before `grok` passes through.)
 38. **The subscription is read as real aterm acks it** (2026-11-13, from claude-code-alab).
     aterm acks `subscribe @<sid> events` with `OK subscribe 1` and the row `sub <local> <sid>
     role=- attention=- user_title=-` (aterm's `subscribe.rs` `ack_tail`), and its events name
@@ -969,7 +1138,8 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     from then on. A grant that changes on aterm's side (a person's cap) is followed both ways
     (`NARROWED`, `WIDENED`). A launch granted less than both duties gives the claim back and
     passes through: a duty taken from aterm's engine and not carried out would be nobody's.
-    Reversible: the scopes in `aterm::SCOPES`.
+    Reversible: the scopes in `aterm::SCOPES`. (Decision 61, 2026-11-14: contract 4 alone; no
+    claim under contract 3 is sent.)
 45. **The launch's failure classes are `alab-wire`'s** (2026-11-14). An aterm that cannot take
     the claim now keeps `grok` the harness's child, unclaimed, and claims every 5 s: an `ERR`
     that asks to be retried (a dialog), a step not answered in time after the handshake, a
@@ -981,7 +1151,9 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     refused subscription. This supersedes the parts of Decisions 10, 13, 35 and 40 that differ:
     Autopilot Off at the launch and contract 2 now supervise, where they passed through, and an
     `ERR` without `retry` now passes through, where Decision 40 read every `ERR` as busy (its
-    one example, a dialog, still reads busy).
+    one example, a dialog, still reads busy). (Decision 61, 2026-11-14: a policy that serves no
+    contract this harness declares, contract 2 alone included, now passes through at the
+    launch; mid-session it still keeps `grok` the child and claims on the clock.)
 46. **A crash is relaunched by aterm's rule, word and back-off** (2026-11-14). Any end
     `alab_wire::relaunch::abnormal_exit` calls abnormal (a non-zero exit but 129, 130, 131 and
     143; a signal but `INT`, `QUIT`, `TERM` and `HUP`, so `KILL` too), under a claim that takes
@@ -1116,9 +1288,10 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     refuses any change in the working copy, an ignored stray file included, and alab-harness's
     `tools/check-pin` is the release check, which also holds the pin to the tag.
     `publish/manifest.txt` ships `vendor`, so the public snapshot builds alone. The copy is
-    never edited here: a defect in it is fixed in alab-harness and taken as a new `v0.1.x` by
+    never edited here: a defect in it is fixed in alab-harness and taken as a new tag by
     running `tools/pin` again and committing, as HX-06's measurement will be. Reversible: the
-    copy, its pin, two dependency lines and one test.
+    copy, its pin, two dependency lines and one test. (Decision 64, 2026-11-14: the copy is
+    v0.7.1.)
 58. **`alab-harness.toml` restates aterm's row for this harness** (2026-11-14, aterm tracker
     HX-10, whose harness ships `alab-harness.toml`, and HX-37, which shrinks the default strip
     list; the seed row is `SEEDS` in aterm's `crates/atpkg/src/harness_record.rs`, which HX-05
@@ -1128,9 +1301,128 @@ Each choice below was made without asking, taking the fail-closed, reversible op
     (`grok-alab`, `grok-alab`, `grok`, `Grok Build`) restate aterm's compiled seed row, so a
     build carrying the record changes nothing when it replaces that row; `env_strip` (`GROK_`,
     `XAI_`) restates the prefixes aterm's default strip list holds for this vendor, so that
-    default can shrink without the vendor's variables reaching shells; `contracts = [3, 4]`
-    because `alab-wire` claims at 4 where aterm serves it, else at 3 (Decision 44). The public
-    snapshot ships it. Reversible: one file and one manifest line.
+    default can shrink without the vendor's variables reaching shells; `contracts = [4]`
+    (Decision 61; it read `[3, 4]` until then, because `alab-wire` claims at 4 where aterm
+    serves it, else at 3, Decision 44), the list `aterm::config` declares to `alab-wire`.
+    `leads` is unchanged. The public snapshot ships it.
+    Reversible: one file and one manifest line.
+59. **`run` adds the launcher's yolo default** (2026-11-14, aterm tracker HX-10d; aterm
+    `docs/DESIGN-harness-interface-2026-11-12.md` §2.1: the launcher keeps its liveness check
+    and `exec <tool> run -- "$@"`, and its other blocks move into the harness). Supersedes
+    Decision 6. `src/yolo.rs` ports atpkg's `yolo::decide` for `grok` alone (its `word_options`
+    row, the vendor row's `yolo_flags`, `yolo_markers`, `yolo_after` and `yolo_skip`, and
+    `--dangerously-skip-permissions` as grok's own alias), comparing bytes, so a word that is
+    not UTF-8 is carried rather than refused, and `src/yolo_tests.rs` holds every `grok` case of
+    atpkg's `yolo_tests.rs`. The launch it decides is the launch from then on: the lanes plan,
+    the claim, every relaunch and `resume_argv` carry `--always-approve`, so a restart keeps the
+    posture the session started with. The stderr line is the launcher's `printf` loop's, byte for
+    byte, written only once the sign-in gate has passed, as the launcher's order puts it. Any
+    scan the port cannot finish (an unknown option, a missing value, a `--yolo` an optional
+    value would swallow) runs as typed, as atpkg's does for a program with an after word.
+    Reversible: one module and one call in `run`.
+60. **`grok update` runs `aterm pkg update grok`** (2026-11-14, HX-10d; atpkg
+    `selfupdate::classify`, the launcher's `sh_selfupdate_prelude` and atpkg's
+    `cli::selfupdate_check`). The first word exactly
+    `update` (`case "$1"`) is classified first, before the store is read, as the launcher runs
+    it before anything else: alone, the harness prints atpkg's announcement with the build's
+    version (`(no version recorded)` with no build or no record) and does what atpkg's
+    `selfupdate_check` does with the launch the launcher hands it. It runs `aterm` on an
+    absolute `PATH` entry with `pkg update grok --wait-lock 1800` (atpkg's `child_argv` for
+    `aterm`; 1800 s is aterm-update-core's `PASS_WAIT_LOCK_SECS`, where a typed `aterm pkg
+    update` waits 10 min for a held store) as its child, a `Command`, never a shell string,
+    with `ATPKG_SPAWNER_PID` set to the harness's pid (so the waiter stands down once the
+    harness is gone, and leaves the held-store line to it), and waits for it. It ends as
+    `selfupdate_check` ends: 0 and 2 as they are, 75 after `contended_line` (naming a person's
+    `aterm pkg` command when the store's holder record says so, else another update), 1 after
+    `stopped_line` for a signal and after `incomplete_line` for any other status, and 126 after
+    `could_not_run_line` when it cannot start. Every line is atpkg's byte for byte, `atpkg:`
+    included, as the yolo block's line keeps the launcher's `aterm:`, so the person reads what
+    the launcher showed before the hand-over. (The first cut exec'd `aterm pkg update grok`
+    alone, which waited 10 min for a held store, passed aterm's status on raw, printed no line
+    after it and prefixed the lines `grok-alab:`; the review of 2026-11-14 found it, and the
+    launcher's own child argv, variable and ending are the observable behaviour this carries.)
+    `-h` or `--help` before a literal `--` prints atpkg's line and hands the words to grok's own
+    help, less a `--no-harness` or `--no-alab-harness` ahead of a literal `--`, which exports
+    `ATERM_NO_HARNESS=1` instead: atpkg forwards help to its `bin/grok` shim, whose yolo block
+    strips that word and exports the variable, and grok's parser refuses the word (found by the
+    review of 2026-11-14); any other shape is refused with atpkg's line, exit 2. With no `aterm` on `PATH` it is refused, exit 2 (the
+    launcher would call `atpkg`, which the harness does not look for: under aterm `aterm pkg` is
+    the same updater, and outside it there is no safe updater to run). Decision 5 still refuses
+    the `update` the launcher never intercepted, read on the final words, so `--yolo update` and
+    `--no-harness update` cannot reach grok's own updater either. Reversible: one module and
+    one call in `run`.
+61. **Contract 4 only** (2026-11-14; HX proofs plan D11, "Every harness declares `contracts =
+    [4]`. A record-bearing build never claims 3"). `alab-harness.toml` says `contracts = [4]`,
+    `aterm::CONTRACTS` is `[Contract::Four]`, and `aterm::config` declares it to `alab-wire`
+    with `Config::with_contracts` (alab-harness v0.7.0, HX-08b, its Decision 33); a unit test
+    holds the record, the constant and the config's list equal. `alab-wire` makes every claim
+    (the launch's, each one made again after a loss or a policy switched back on) under the
+    declared list alone, and none while aterm's policy lists none of it: it answers
+    `Failure::Unserved` (`policy contract=2,3 declared=4`), with nothing sent after the policy
+    read, no roster read and no claim. At the launch the harness reads that answer
+    (`Link::unclaimed`) and passes `grok` through, as for any claim aterm refuses: nothing was
+    claimed, so nothing is given back. Mid-session the link stays lost, `grok` runs on
+    unclaimed, and the claim is made under 4 once aterm serves it. This closes the open defect
+    this decision tracked from the review of 2026-11-14 until the v0.7.0 pin (Decision 64):
+    `alab-wire` v0.1.0 to v0.6.0 claimed at the highest contract both sides listed, from a list
+    of its own (`[4, 3]`) a harness could not narrow, so against an aterm serving `2,3` every
+    launch sent `meta set supervisor grok-alab@<pid> contract=3 …` behind the roster guard, and
+    the harness gave the claim back at once (`aterm::give_back_unspoken`, called at the launch
+    and after every claim made again) and passed through, or ran on unclaimed with the link
+    absent. v0.7.0 made both give-backs redundant, and they are deleted; no claim at 3 is ever
+    sent, which the tests now assert (the launch against `2,3` and against contract 2 alone
+    sends only `harness policy`; an aterm that comes back serving `2,3` is never claimed under
+    3 on any attempt). Three things differ from the give-back: an aterm serving contract 2
+    alone now passes through at the launch too, where Decision 45 kept `grok` the child,
+    because `alab-wire` answers it and `2,3` alike and a split would read the failure's text;
+    an aterm that comes back serving no 4 is claimed under 4 once it serves it again, where the
+    given-back link stayed absent; and, while it serves no 4, the link is lost and still counts
+    as holding a claim (`Link::claims`), so a `grok` crash waits up to `alab-wire`'s 45 s
+    `AWAY_BUDGET` for a claim under 4 before it ends (`claim-not-proven-again`), where the
+    absent link ended it at once, and aterm's input clock counts as unread, so a late exit
+    after a move's `SIGTERM` reads as the person's quit (Decisions 22 and 50), where the absent
+    link was judged on the terminal's clock alone. That is how every lost link behaves, and
+    what Decision 50 asks of a claim given back under aterm. Reversible: one constant, one
+    record line and one config call.
+62. **The sign-in gate's rule is the launcher's** (2026-11-14, HX-10d; atpkg
+    `sh_signin_prelude`). `signin::gated` reads the launch as typed, word by word, as the
+    launcher's `while` loop does: a literal `--` is gated; `--no-harness` or a one-shot option
+    is not; an option that takes a value skips it (an optional one only when the next word is
+    no option); any other option is passed over; the first word is gated unless it is a local
+    subcommand or `update`. It replaces the lanes-plan rule of Decision 26, which gated every
+    launch the plan could not carry, where the launcher passes an unknown option over and reads
+    the word after it (`--unknown login` asked before, and does not now). The relaunch gate
+    (Decision 21) is unchanged. Reversible: one function.
+63. **`--no-harness` in `run` asks for grok alone** (2026-11-14, HX-10d; atpkg
+    `strip_no_harness` and the launcher's yolo block, which strips the word ahead of a literal
+    `--` and exports `ATERM_NO_HARNESS=1`). The word is dropped, the gate does not ask (the
+    launcher's gate skips it), and `grok` runs in the harness's place with `ATERM_NO_HARNESS=1`
+    and the shim environment, without a claim. No default posture is added under it: the task
+    and the design read `--no-harness` as no harness duty at all, though today's launcher still
+    adds the default there (aterm `crates/atpkg/src/platform/mod_sh_shim_tests.rs`, its
+    `--no-harness` cases). Today the launcher never hands such a launch on (its yolo block
+    strips the word and its hand-off skips the harness under `ATERM_NO_HARNESS`); once the
+    launcher's blocks for `grok` are deleted, `grok --no-harness` reaches `run` and runs without
+    `--always-approve`. A typed `--yolo` is still the flag it names. Reversible: one branch in
+    `run`.
+64. **`alab-wire` is the alab-harness v0.7.0 copy, with the session stream kept off**
+    (2026-11-14, aterm tracker HX-08b; alab-harness Decision 33). alab-harness's `tools/pin`
+    moved `vendor/alab-harness` from v0.1.0 to v0.7.0 (tree e4c1f87), the first tag whose
+    `Config` takes the contracts a harness declares (Decision 61). Of what came between, two
+    parts are pinned and not taken. The session stream (v0.4.0) is opened on every contract-4
+    grant unless the config says `with_stream(false)`, which `aterm::config` says until this
+    harness takes the stream (HX-19): the claim is held as it was, renewed on its own
+    connection and woken by the event subscription, and `stream` is never sent (the contract-4
+    claim's test counts every verb aterm is sent). The re-exec (v0.6.0, `alab_wire::reexec`)
+    is a package of its own ("Next milestone"). `alab-policy` (v0.2.0 on) is in the copy and is
+    not a dependency. With the stream off, what v0.1.0 to v0.7.0 changed in the link (a lost
+    contract-4 claim given back explicitly within aterm's 45 s grace, alab-harness Decision 30)
+    changes nothing the harness's tests see. `Link::unclaimed` (a lost link's last failure)
+    changed nothing on the pin alone; Decision 61 reads it at the launch since the commit after
+    the pin, and its tests assert what it says. Reversible: the pin and one config call.
+    (2026-11-14: v0.7.1 followed, tree f336fe1. It changes no library code; it fixes three
+    `alab-wire` test races and drops `docs/HX-06-aterm-map-2026-11-13.md` from the tree, a
+    planning page the copy carried into this harness's public snapshot, which ships `vendor`.)
 
 ## License
 

@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The harness under aterm, end to end, against `alab-wire`'s fake aterm control socket
-//! (`alab_wire::fake`) and fake grok builds: the launch's claim (at contract 4, or 3 behind the
-//! roster guard), grok run in the harness's place when aterm refuses it, supervised and claimed
-//! again when aterm cannot take it now; aterm's read of the screen as the safe point; the crash
-//! relaunch on aterm's word and back-off; and the restarts aterm asks for.
+//! (`alab_wire::fake`) and fake grok builds: the launch's claim (at contract 4 alone, and never
+//! one at 3), grok run in the harness's place when aterm refuses it or serves no contract 4,
+//! supervised and claimed again when aterm cannot take it now; aterm's read of the screen as the
+//! safe point; the crash relaunch on aterm's word and back-off; and the restarts aterm asks for.
 
 mod common;
 
@@ -72,6 +72,11 @@ fn claims(fake: &FakeAterm) -> Vec<String> {
         .collect()
 }
 
+/// Whether any claim sent so far was made under contract 3, which this build never sends.
+fn claimed_under_3(fake: &FakeAterm) -> bool {
+    claims(fake).iter().any(|c| c.contains(" contract=3 "))
+}
+
 fn released(fake: &FakeAterm, holder: &str) -> bool {
     fake.verbs()
         .iter()
@@ -134,21 +139,25 @@ fn journal_says(rig: &Rig, what: &str) {
 /// harness pid in its environment, the shim environment applied. That is a refused or unproven
 /// claim, a policy off by a fact of the window, an `ERR` that does not ask to be retried (an
 /// aterm without the verb), a policy with no `contract=` at all (an aterm from before contract
-/// 3, which never claims at one), a refused event subscription, and a grant short of both
-/// duties (given back first).
+/// 3, which never claims at one), a refused event subscription, and a claim short of both
+/// duties, given back first: aterm's reply granting less, a cap that narrows the claim between
+/// its reply and the `status` read back (aterm's newer revision is the grant), and a claim aterm
+/// stores with less than its reply granted (the read-back proves no `upgrade`).
 #[test]
 fn under_aterm_a_refused_claim_runs_grok_in_the_harness_place() {
     type Setup = fn(&FakeAterm);
-    let cases: [(&str, Setup, &str); 7] = [
+    let cases: [(&str, Setup, &str, bool); 9] = [
         (
             "a refused claim",
             |f| f.set_claim_reply("ERR unproven: not the foreground leader"),
             "claim reply=ERR:unproven:",
+            false,
         ),
         (
             "an unconfirmed claim",
             |f| f.set_proven(false),
             "unproven supervisor=grok-alab@",
+            true,
         ),
         (
             "a headless window",
@@ -159,11 +168,13 @@ fn under_aterm_a_refused_claim_runs_grok_in_the_harness_place() {
                 ))
             },
             "policy effective=off why=headless",
+            false,
         ),
         (
             "an aterm without the verb",
             |f| f.set_policy_reply("ERR unknown verb harness"),
             "policy reply=ERR:unknown",
+            false,
         ),
         (
             "an aterm that predates contract 3",
@@ -173,19 +184,34 @@ fn under_aterm_a_refused_claim_runs_grok_in_the_harness_place() {
                 )
             },
             "policy contract=absent",
+            false,
         ),
         (
             "a refused subscription",
             |f| f.set_subscribe_reply(Some("ERR usage: subscribe")),
             "events",
+            false,
         ),
         (
             "a grant without upgrade",
             |f| f.set_cap(Some(&[Scope::Relaunch])),
             "aterm granted scope=relaunch; the claim needs relaunch,upgrade",
+            true,
+        ),
+        (
+            "a cap between the claim and its read-back",
+            |f| f.set_cap_after_next_claim(Some(&[Scope::Relaunch])),
+            "aterm granted scope=relaunch; the claim needs relaunch,upgrade",
+            true,
+        ),
+        (
+            "a stored claim short of its reply",
+            |f| f.set_unstored(&[Scope::Upgrade]),
+            "unproven scope=upgrade supervisor_scope=relaunch",
+            true,
         ),
     ];
-    for (what, setup, why) in cases {
+    for (what, setup, why, given_back) in cases {
         let (rig, id) = rig_v1("pass");
         let fake = aterm("pass");
         setup(&fake);
@@ -198,8 +224,8 @@ fn under_aterm_a_refused_claim_runs_grok_in_the_harness_place() {
         assert_eq!(start.autoupdater, "1", "{what}: the shim environment");
         assert_eq!(
             start.argv,
-            ["first prompt"],
-            "{what}: the launch's own argv, no injected id"
+            ["--always-approve", "first prompt"],
+            "{what}: the launch's own argv with the launcher's yolo default, no injected id"
         );
         let journal = rig.journal_text();
         assert!(
@@ -208,7 +234,7 @@ fn under_aterm_a_refused_claim_runs_grok_in_the_harness_place() {
         );
         assert!(journal.contains(why), "{what}: {journal}");
         assert_eq!(fake.holder(), None, "{what}: no claim is left standing");
-        if what.contains("unconfirmed") || what.contains("grant") {
+        if given_back {
             assert!(
                 fake.verbs()
                     .iter()
@@ -230,24 +256,39 @@ fn a_harness_left_out_or_with_nothing_to_carry_passes_through_without_asking_ate
         &'static str,
         &'static [&'static str],
         &'static [(&'static str, &'static str)],
+        &'static [&'static str],
     );
-    let cases: [Case; 4] = [
-        ("ATERM_NO_HARNESS=1", &["hi"], &[("ATERM_NO_HARNESS", "1")]),
-        ("a subcommand", &["sessions"], &[]),
-        ("a resume the harness cannot carry", &["--continue"], &[]),
+    // What grok runs with is the launch as typed with the launcher's yolo default, which a
+    // subcommand of the row's `yolo_skip` does not get.
+    let cases: [Case; 5] = [
+        (
+            "ATERM_NO_HARNESS=1",
+            &["hi"],
+            &[("ATERM_NO_HARNESS", "1")],
+            &["--always-approve", "hi"],
+        ),
+        ("--no-harness typed", &["--no-harness", "hi"], &[], &["hi"]),
+        ("a subcommand", &["sessions"], &[], &["sessions"]),
+        (
+            "a resume the harness cannot carry",
+            &["--continue"],
+            &[],
+            &["--always-approve", "--continue"],
+        ),
         (
             "no graph entry",
             &["hi"],
             &[("ATERM_PARENT_SESSION_ID", "s-dead")],
+            &["--always-approve", "hi"],
         ),
     ];
-    for (what, args, env) in cases {
+    for (what, args, env, runs) in cases {
         let (rig, _) = rig_v1("left-out");
         let fake = aterm("left-out");
         let (mut h, _pty) = start_in_tab(&rig, Some(&fake), args, env);
         let start = rig.starts()[0].clone();
         assert_eq!(start.pid, h.pid, "{what}: exec in place");
-        assert_eq!(start.argv, *args, "{what}");
+        assert_eq!(start.argv, *runs, "{what}");
         assert!(
             fake.verbs().is_empty(),
             "{what}: aterm was asked {:?}",
@@ -328,104 +369,67 @@ fn the_claim_is_made_at_contract_4_and_names_the_child_grok_runs_as() {
     );
 }
 
-/// AGAINST AN ATERM WITHOUT CONTRACT 4 the claim is contract 3's: the roster is read first
-/// (`native-act info` must list `grok-alab:upgrade`), and the child is announced again with
-/// the same line, which contract 3 gives no `child=`.
+/// AGAINST AN ATERM WITHOUT CONTRACT 4 no claim is sent and grok runs in the harness's place:
+/// this build declares contract 4 alone (`contracts = [4]`, Decision 61), so `alab-wire` reads
+/// the policy and sends nothing more, whatever aterm's roster says: no roster read, no claim at
+/// contract 3, and nothing to give back. That is an aterm serving `2,3` (rostering `grok-alab`,
+/// without its row, or without the roster verb) and one serving contract 2 alone.
 #[test]
-fn against_an_aterm_without_contract_4_the_claim_is_contract_3s_behind_the_roster_guard() {
-    let (rig, _) = rig_v1("claim-3");
-    let fake = aterm("claim-3");
-    fake.serve_contracts(&[2, 3]);
-    let (mut h, _pty) = start_in_tab(&rig, Some(&fake), &["first prompt"], &[]);
-    let holder = format!("grok-alab@{}", h.pid);
-    let claim = format!(
-        "meta set supervisor {holder} contract=3 scope=relaunch,upgrade version={VERSION} vendor=1.0.70"
-    );
-    assert!(
-        wait_until(END, || fake.verbs().len() >= 5),
-        "{:?}",
-        fake.verbs()
-    );
-    assert_eq!(
-        fake.verbs()[..5],
-        [
-            "harness policy",
-            "native-act info",
-            &claim,
-            "status",
-            &claim
-        ],
-        "the roster before the claim, and no child= under contract 3"
-    );
-    assert_eq!(fake.holder(), Some(holder.clone()));
-    assert_eq!(fake.child(), None);
-    assert!(
-        rig.journal_text()
-            .contains(&format!("CLAIMED holder={holder} contract=3")),
-        "{}",
-        rig.journal_text()
-    );
-    assert_eq!(exit_code(end(&mut h, &rig)), Some(0));
-}
-
-/// THE ROSTER GUARD AND THE SCOPE READ-BACK under contract 3 (Decision 37): an aterm whose
-/// `native-act info` lists no `grok-alab:upgrade` row is never sent a claim, not even to find
-/// out (aterm stores an unrostered contract-3 claim as a foreign one that takes every duty),
-/// and a claim aterm stores without both duties in `supervisor_scope=` is let go. Both pass
-/// through.
-#[test]
-fn an_unrostered_harness_claims_nothing_and_a_short_scope_is_let_go() {
+fn against_an_aterm_without_contract_4_no_claim_is_sent_and_grok_passes_through() {
     type Setup = fn(&FakeAterm);
-    let cases: [(&str, Setup, &str, bool); 3] = [
+    let cases: [(&str, Setup, &str); 4] = [
         (
-            "no grok-alab row",
-            |f| f.set_row("grok-alab", &[]),
-            "unrostered",
-            false,
+            "2,3 rostering grok-alab",
+            |f| f.serve_contracts(&[2, 3]),
+            "2,3",
         ),
         (
-            "an aterm without the verb",
-            |f| f.set_info("ERR unknown verb native-act"),
-            "unrostered",
-            false,
+            "2,3 with no grok-alab row",
+            |f| {
+                f.serve_contracts(&[2, 3]);
+                f.set_row("grok-alab", &[]);
+            },
+            "2,3",
         ),
         (
-            "relaunch only",
-            |f| f.set_cap_after_next_claim(Some(&[Scope::Relaunch])),
-            "unproven scope=upgrade supervisor_scope=relaunch",
-            true,
+            "2,3 without the roster verb",
+            |f| {
+                f.serve_contracts(&[2, 3]);
+                f.set_info("ERR unknown verb native-act");
+            },
+            "2,3",
         ),
+        ("contract 2 alone", |f| f.serve_contracts(&[2]), "2"),
     ];
-    for (what, setup, why, claimed) in cases {
-        let (rig, _) = rig_v1("roster");
-        let fake = aterm("roster");
-        fake.serve_contracts(&[2, 3]);
+    for (what, setup, served) in cases {
+        let (rig, id) = rig_v1("unserved");
+        let fake = aterm("unserved");
         setup(&fake);
         let (mut h, _pty) = start_in_tab(&rig, Some(&fake), &["first prompt"], &[]);
+        let start = rig.starts()[0].clone();
+        assert_eq!(start.pid, h.pid, "{what}: grok runs in the harness's place");
+        assert_eq!(start.build, id, "{what}");
+        assert_eq!(start.harness, "", "{what}: no harness pid");
         assert_eq!(
-            rig.starts()[0].pid,
-            h.pid,
-            "{what}: grok runs in the harness's place"
+            fake.verbs(),
+            ["harness policy"],
+            "{what}: the policy read alone: no roster read, no claim, nothing given back"
         );
+        assert!(!claimed_under_3(&fake), "{what}");
+        assert_eq!(fake.holder(), None, "{what}");
         let journal = rig.journal_text();
-        assert!(journal.contains("PASS grok"), "{what}: {journal}");
-        assert!(journal.contains(why), "{what}: {journal}");
-        assert_eq!(fake.holder(), None, "{what}: no claim is left standing");
-        assert_eq!(
-            claims(&fake).is_empty(),
-            !claimed,
-            "{what}: {:?}",
-            fake.verbs()
+        let why = format!("policy contract={served} declared=4");
+        assert!(
+            journal.contains(&format!("UNCLAIMED {why}")),
+            "{what}: {journal}"
         );
-        if claimed {
-            assert!(
-                fake.verbs()
-                    .iter()
-                    .any(|v| v.starts_with("meta unset supervisor holder=grok-alab@")),
-                "{what}: {:?}",
-                fake.verbs()
-            );
-        }
+        assert!(
+            journal.contains(&format!(
+                "PASS grok 1.0.70 runs in the harness's place (exec): aterm serves no contract \
+                 this build claims under ({why}); nothing was claimed"
+            )),
+            "{what}: {journal}"
+        );
         assert_eq!(exit_code(end(&mut h, &rig)), Some(0), "{what}");
     }
 }
@@ -436,8 +440,8 @@ type Later = (&'static str, fn(&FakeAterm), fn(&FakeAterm), &'static str);
 
 /// An aterm that cannot take the claim now keeps grok the harness's child, unclaimed, and the
 /// claim is made every 5 s until it stands (Decisions 35, 40, 45): aterm busy (a dialog's `ERR
-/// … retry` to the policy or to the proof, a launch read answered late), an aterm that serves
-/// no contract this harness speaks yet, and a policy a person switched off.
+/// … retry` to the policy or to the proof, a launch read answered late) and a policy a person
+/// switched off. (An aterm that serves no contract 4 passes grok through, Decision 61.)
 fn claimed_once_aterm_can(cases: &[Later]) {
     for (what, setup, answer, why) in cases {
         let (rig, _) = rig_v1("later");
@@ -496,26 +500,18 @@ fn a_busy_aterm_at_the_launch_keeps_grok_supervised_and_claims_once_it_answers()
 }
 
 #[test]
-fn an_aterm_that_serves_no_contract_yet_or_is_switched_off_is_claimed_once_it_admits_one() {
-    claimed_once_aterm_can(&[
-        (
-            "contract 2 only",
-            |f| f.serve_contracts(&[2]),
-            |f| f.serve_contracts(&[2, 3, 4]),
-            "policy contract=2",
-        ),
-        (
-            "Autopilot Off",
-            |f| {
-                f.set_policy(&policy(
-                    "effective=on why=enabled",
-                    "effective=off why=autopilot-off",
-                ));
-            },
-            |f| f.set_policy(POLICY_ON),
-            "policy effective=off why=autopilot-off",
-        ),
-    ]);
+fn a_policy_switched_off_at_the_launch_keeps_grok_supervised_and_is_claimed_once_it_is_on() {
+    claimed_once_aterm_can(&[(
+        "Autopilot Off",
+        |f| {
+            f.set_policy(&policy(
+                "effective=on why=enabled",
+                "effective=off why=autopilot-off",
+            ));
+        },
+        |f| f.set_policy(POLICY_ON),
+        "policy effective=off why=autopilot-off",
+    )]);
 }
 
 /// THE SAFE POINT FROM ATERM, ON A SCREEN ONLY A MEASURED GROK READER GIVES (`agent=idle`,
@@ -737,7 +733,10 @@ fn a_crashed_grok_is_relaunched_on_aterms_ladder_and_a_term_in_its_pause_ends_it
     );
     let second = rig.starts()[1].clone();
     assert_eq!(second.build, id);
-    assert_eq!(second.argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        second.argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     assert_eq!(second.harness, h.pid.to_string());
     let journal = rig.journal_text();
     assert!(
@@ -807,25 +806,6 @@ fn a_crash_outside_aterm_or_with_a_person_at_the_keys_is_not_relaunched() {
     );
 }
 
-/// Lays a fake `aterm` executable on the rig's PATH that records each call and exits
-/// `$FAKE_ATERM_EXIT` (default 0); returns the calls file. (The claim goes to the fake control
-/// socket; this is the binary the sign-in gate runs.)
-fn fake_aterm_bin(rig: &Rig) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let calls = rig.root.join("aterm.calls");
-    let bin = rig.path_dir.join("aterm");
-    std::fs::write(
-        &bin,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit \"${{FAKE_ATERM_EXIT:-0}}\"\n",
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    calls
-}
-
 /// The rig's grok home login (`$HOME/.grok/auth.json`).
 fn login(rig: &Rig) -> std::path::PathBuf {
     rig.home.join(".grok").join("auth.json")
@@ -842,7 +822,7 @@ fn a_crash_relaunch_on_a_signed_out_machine_asks_aterm_to_sign_in_first() {
     for (exit, relaunched) in [("1", false), ("0", true)] {
         let (rig, _) = rig_v1(&format!("crash-signin-{exit}"));
         let fake = aterm("crash-signin");
-        let calls = fake_aterm_bin(&rig);
+        let calls = rig.fake_aterm();
         std::fs::create_dir_all(login(&rig).parent().unwrap()).unwrap();
         std::fs::write(login(&rig), "{}").unwrap();
         let env = [("ATERM_CHILD", "1"), ("FAKE_ATERM_EXIT", exit)];
@@ -908,7 +888,7 @@ fn a_move_waits_while_the_machine_is_signed_out() {
     let fake = aterm("move-signin");
     // A screen only a measured Grok reader gives, so only the sign-in holds the move.
     reader_screen(&fake);
-    let calls = fake_aterm_bin(&rig);
+    let calls = rig.fake_aterm();
     std::fs::create_dir_all(login(&rig).parent().unwrap()).unwrap();
     std::fs::write(login(&rig), "{}").unwrap();
     let (mut h, _pty) = start_in_tab(
@@ -1173,6 +1153,56 @@ fn a_claim_aterm_dropped_is_made_again_without_waiting_for_an_act() {
     assert_eq!(exit_code(end(&mut h, &rig)), Some(0));
 }
 
+/// AN ATERM THAT COMES BACK SERVING NO CONTRACT 4 is never claimed under 3: `alab-wire` makes
+/// the claim again only under the contracts this build declares (Decision 61), so the new
+/// aterm's `2,3` leaves the link lost (`UNCLAIMED policy contract=2,3 declared=4`) and no attempt
+/// on the 5 s clock sends a roster read or a claim at 3. grok runs on, untouched and unclaimed,
+/// and is claimed under 4 once aterm serves it again.
+#[test]
+fn an_aterm_that_comes_back_without_contract_4_is_never_claimed_under_3_and_grok_runs_on() {
+    let (rig, _) = rig_v1("reclaim-3");
+    let fake = aterm("reclaim-3");
+    let (mut h, _pty) = start_in_tab(&rig, Some(&fake), &["first prompt"], &[]);
+    let holder = format!("grok-alab@{}", h.pid);
+    assert_eq!(fake.holder(), Some(holder.clone()));
+    fake.serve_contracts(&[2, 3]);
+    fake.restart();
+    journal_says(&rig, "UNCLAIMED policy contract=2,3 declared=4");
+    // One more attempt on the reclaim clock: a policy read again, and still no claim.
+    let reads = |fake: &FakeAterm| {
+        fake.verbs()
+            .iter()
+            .filter(|v| *v == "harness policy")
+            .count()
+    };
+    let read = reads(&fake);
+    assert!(
+        wait_until(END, || reads(&fake) > read),
+        "no attempt after the first: {:?}",
+        fake.verbs()
+    );
+    assert_eq!(fake.holder(), None, "no claim stands");
+    assert!(!claimed_under_3(&fake), "{:?}", fake.verbs());
+    assert!(
+        !fake.verbs().iter().any(|v| v == "native-act info"),
+        "no roster read: {:?}",
+        fake.verbs()
+    );
+    assert_eq!(rig.starts().len(), 1, "grok was never touched");
+    let first = rig.starts()[0].clone();
+    assert!(exists(first.pid) && h.alive(), "{}", rig.journal_text());
+    fake.serve_contracts(&[2, 3, 4]);
+    assert!(
+        wait_until(END, || fake.holder() == Some(holder.clone())),
+        "never claimed under 4 once aterm served it: {}",
+        rig.journal_text()
+    );
+    journal_says(&rig, &format!("CLAIMED holder={holder} contract=4"));
+    assert!(!claimed_under_3(&fake), "{:?}", fake.verbs());
+    assert_eq!(rig.starts().len(), 1, "grok was never touched");
+    assert_eq!(exit_code(end(&mut h, &rig)), Some(0));
+}
+
 /// A SIGNED-OUT GROK IS NEVER RELAUNCHED: a relaunch is the harness's own act, and a signed-out
 /// Grok Build opens xAI's sign-in page in the desk's browser. The crash ends the session, and
 /// the person is told why and how to resume.
@@ -1258,7 +1288,10 @@ fn a_restart_aterm_asks_for_resumes_the_session_at_once() {
     );
     let second = rig.starts()[1].clone();
     assert_eq!(second.build, id);
-    assert_eq!(second.argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        second.argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     assert!(rig.log_text().contains(&format!("term build={id}")));
     let journal = rig.journal_text();
     assert!(
@@ -1268,7 +1301,7 @@ fn a_restart_aterm_asks_for_resumes_the_session_at_once() {
         "{journal}"
     );
     assert!(
-        journal.contains("for aterm's restart cause=asked: --resume"),
+        journal.contains("for aterm's restart cause=asked: --always-approve --resume"),
         "{journal}"
     );
     assert!(!journal.contains("CRASH"), "{journal}");
@@ -1313,7 +1346,10 @@ fn a_stall_restart_kills_a_grok_deaf_to_its_sigterm() {
         ),
         "{journal}"
     );
-    assert_eq!(rig.starts()[1].argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        rig.starts()[1].argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     // This grok ignores TERM too: the session ends with the harness's TERM passed on, and
     // then a KILL.
     let last = rig.starts()[1].pid;
@@ -1350,7 +1386,12 @@ fn a_model_restart_resumes_on_that_model_and_an_account_move_is_refused() {
     );
     assert_eq!(
         rig.starts()[1].argv,
-        ["--model=grok-4", "--resume", session.as_str()]
+        [
+            "--always-approve",
+            "--model=grok-4",
+            "--resume",
+            session.as_str()
+        ]
     );
     journal_says(&rig, "for aterm's restart cause=model model=grok-4");
     // The model stays for every later relaunch: a crash resumes on it too.
@@ -1363,7 +1404,12 @@ fn a_model_restart_resumes_on_that_model_and_an_account_move_is_refused() {
     );
     assert_eq!(
         rig.starts()[2].argv,
-        ["--model=grok-4", "--resume", session.as_str()]
+        [
+            "--always-approve",
+            "--model=grok-4",
+            "--resume",
+            session.as_str()
+        ]
     );
     assert_eq!(exit_code(end(&mut h, &rig)), Some(0));
 }
@@ -1578,7 +1624,10 @@ fn a_cap_that_withdraws_upgrade_mid_move_resumes_on_the_running_build() {
         "moved onto the newer build without upgrade: {}",
         rig.journal_text()
     );
-    assert_eq!(second.argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        second.argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     journal_says(
         &rig,
         "HOLD aterm no longer grants upgrade (scope=relaunch); grok resumes on 1.0.70, not 1.0.71",
@@ -1643,7 +1692,10 @@ fn a_crash_while_the_claim_is_lost_waits_for_it_within_the_away_budget() {
     );
     let second = rig.starts()[1].clone();
     assert_eq!(second.build, id);
-    assert_eq!(second.argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        second.argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     assert_eq!(fake.holder(), Some(holder));
     let journal = rig.journal_text();
     let claimed = journal.find(" CLAIMED holder=grok-alab@").unwrap();

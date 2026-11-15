@@ -5,7 +5,7 @@ resolver = "3"
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates"]
@@ -83,15 +83,16 @@ rustix = { version = "1.1.5", features = ["termios", "process"] }
 # unset or empty (a relative HOME it hands back as it is).
 nix = { version = "0.31.3", default-features = false, features = ["user"] }
 # The aterm client every ALab harness shares (alab-harness `crates/alab-wire`): the wire, the
-# claim at contract 4 or 3 with its guards, the link held, lost and claimed again, aterm's
-# safe-point and relaunch judgements, and the crash ladder (src/aterm.rs, Decision 43). The crate
-# is the vendored alab-harness v0.1.0 copy at vendor/alab-harness, pinned by its git tree id in
-# vendor/alab-harness.pin (alab-harness tools/pin; re-pin to move, Decision 57).
+# claim under the contracts the harness declares with its guards, the link held, lost and claimed
+# again, aterm's safe-point and relaunch judgements, and the crash ladder (src/aterm.rs, Decision
+# 43). The crate is the vendored alab-harness v0.7.1 copy at vendor/alab-harness, pinned by its
+# git tree id in vendor/alab-harness.pin (alab-harness tools/pin; re-pin to move, Decisions 57
+# and 64).
 alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
 
 [dev-dependencies]
 # alab-wire's fake aterm control socket, which the integration tests run the harness against:
-# the same vendored, pinned v0.1.0 copy.
+# the same vendored, pinned v0.7.1 copy.
 alab-wire = { path = "vendor/alab-harness/crates/alab-wire", features = ["fake"] }
 
 [lints.rust]

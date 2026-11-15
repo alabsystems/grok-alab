@@ -17,10 +17,16 @@
 //! ([`crate::credentials::signed_in`], which also reads aterm's refusal marker), and
 //! when that says signed out it runs the aterm verb in the foreground and starts `grok` only
 //! once that exits 0. Otherwise a first start exits [`EXIT_SIGNED_OUT`] (69, `EX_UNAVAILABLE`)
-//! with one line, and a relaunch ends the session with its resume hint; `grok` never runs. A
-//! launch is gated unless it is a one-shot option or one of
-//! [`LOCAL_COMMANDS`] ([`gated`]). This is not a claim on the session (no supervision, nothing
-//! typed; see [`crate::aterm`]), so it needs no contract 3.
+//! with one line, and a relaunch ends the session with its resume hint; `grok` never runs. This
+//! is not a claim on the session (no supervision, nothing typed; see [`crate::aterm`]), so it
+//! needs no contract.
+//!
+//! WHICH LAUNCH IS GATED is the launcher's rule, carried here whole (aterm
+//! `docs/DESIGN-harness-interface-2026-11-12.md` §2.1): aterm's `grok` launcher gates a launch
+//! before it hands it on (`crates/atpkg/src/platform/mod.rs`, `sh_signin_prelude`, from the
+//! `grok` row's `signin_gate`, `GROK_SIGNIN_GATE` in `crates/atpkg/src/vendor_direct/table.rs`),
+//! and deletes that block once this harness leads the word. [`gated`] reads the launch as
+//! typed, word for word as that block's loop does.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -58,17 +64,89 @@ pub const LOCAL_COMMANDS: &[&str] = &[
     "trace",
 ];
 
-/// Whether a launch with this plan is gated: every launch but a one-shot option (`--help`,
-/// `--version`, `-p` and the other one-prompt options) and a subcommand of [`LOCAL_COMMANDS`].
+/// The options that answer and exit, or run one prompt and exit: a launch carrying one ahead of
+/// a literal `--` is never gated (atpkg `GROK_SIGNIN_GATE.one_shot`: Grok Build 1.0.70's
+/// `--help` and `--version` spellings and the one-prompt options of its `PagerArgs`). A long one
+/// also matches its `--option=value` form.
+pub const ONE_SHOT: &[&str] = &[
+    "-h",
+    "--help",
+    "-v",
+    "-V",
+    "--version",
+    "-p",
+    "--single",
+    "--print",
+    "--prompt-file",
+    "--prompt-json",
+];
+
+/// Whether `a` is one of [`ONE_SHOT`], or a long one's `=value` form.
+fn one_shot(a: &[u8]) -> bool {
+    ONE_SHOT.iter().any(|f| {
+        let f = f.as_bytes();
+        a == f || (f.starts_with(b"--") && a.starts_with(f) && a.get(f.len()) == Some(&b'='))
+    })
+}
+
+/// What the next word is to the gate's scan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// A word of its own.
+    Word,
+    /// The value of the option before it.
+    Value,
+    /// The value of the option before it, unless it starts with `-`.
+    Maybe,
+}
+
+/// Whether the launch `args` (as typed, after `run --`) is gated, read as aterm's launcher
+/// reads it (atpkg `sh_signin_prelude`'s loop for the `grok` row): word by word, stopping at a
+/// literal `--` (gated); `--no-harness` or `--no-alab-harness` takes the gate away; a one-shot
+/// option ([`ONE_SHOT`]) is not gated; the value of a leading option is skipped
+/// ([`crate::yolo::VALUES`] less the one-shot ones, and [`crate::yolo::OPTIONAL`]'s when it does
+/// not start with `-`); any other option is passed over; and a first word that is one of
+/// [`LOCAL_COMMANDS`] or the self-update verb ([`crate::selfupdate::VERBS`]) is not gated. Every
+/// other launch is, an unknown subcommand too (fail closed).
 #[must_use]
-pub fn gated(plan: &crate::lanes::Plan) -> bool {
-    match plan {
-        crate::lanes::Plan::PassThrough {
-            command: Some(c), ..
-        } => !LOCAL_COMMANDS.contains(&c.as_str()),
-        crate::lanes::Plan::PassThrough { command: None, .. } => false,
-        crate::lanes::Plan::Uncarried { .. } | crate::lanes::Plan::Session(_) => true,
+pub fn gated(args: &[std::ffi::OsString]) -> bool {
+    use crate::yolo::listed;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut next = Next::Word;
+    let mut first = true;
+    for arg in args {
+        let a = arg.as_bytes();
+        match next {
+            Next::Value => {
+                next = Next::Word;
+                continue;
+            }
+            Next::Maybe => {
+                next = Next::Word;
+                if !a.starts_with(b"-") {
+                    continue;
+                }
+            }
+            Next::Word => {}
+        }
+        if a == b"--" {
+            return true;
+        }
+        if listed(&crate::yolo::NO_HARNESS_WORDS, a) || one_shot(a) {
+            return false;
+        }
+        if listed(crate::yolo::VALUES, a) {
+            next = Next::Value;
+        } else if listed(crate::yolo::OPTIONAL, a) {
+            next = Next::Maybe;
+        } else if !a.starts_with(b"-") && first {
+            first = false;
+            if listed(LOCAL_COMMANDS, a) || listed(crate::selfupdate::VERBS, a) {
+                return false;
+            }
+        }
     }
+    true
 }
 
 /// Whether the gate applies: under aterm (`ATERM_CHILD=1`, the variable aterm sets for every
@@ -165,15 +243,11 @@ mod tests {
         Env::from_pairs(pairs)
     }
 
+    /// The launcher's own cases (aterm `crates/atpkg/src/platform/mod_sh_shim_tests.rs`, the
+    /// `grok` sign-in block executed): gated, and never gated.
     #[test]
-    fn only_a_one_shot_option_or_a_local_subcommand_skips_the_gate() {
-        let plan = |args: &[&str]| {
-            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            crate::lanes::plan(
-                &args,
-                Some("00000000-0000-4000-8000-000000000000".to_string()),
-            )
-        };
+    fn only_a_one_shot_option_a_local_subcommand_or_no_harness_skips_the_gate() {
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         for args in [
             &[][..],
             &["fix it"][..],
@@ -183,19 +257,36 @@ mod tests {
             &["models"][..],
             &["agent", "stdio"][..],
             &["fix it", "dashboard"][..],
+            &["fix it", "login"][..],
+            &["-m", "grok-4", "fix it"][..],
+            &["-r", "login"][..],
+            &["--", "-p"][..],
         ] {
-            assert!(gated(&plan(args)), "{args:?}: {:?}", plan(args));
+            assert!(gated(&os(args)), "{args:?}");
         }
         for args in [
             &["login"][..],
             &["logout"][..],
+            &["login", "--device-auth"][..],
             &["--help"][..],
+            &["-h"][..],
             &["--version"][..],
+            &["-v"][..],
             &["-p", "hi"][..],
+            &["--print=hi"][..],
+            &["--single", "hi"][..],
+            &["-m", "grok-4", "-p", "hi"][..],
+            &["fix it", "-p", "hi"][..],
+            &["update"][..],
             &["mcp", "list"][..],
             &["doctor"][..],
+            &["leader", "kill"][..],
+            &["-w", "feat", "inspect"][..],
+            &["--unknown", "login"][..],
+            &["--no-harness"][..],
+            &["--no-alab-harness", "fix it"][..],
         ] {
-            assert!(!gated(&plan(args)), "{args:?}: {:?}", plan(args));
+            assert!(!gated(&os(args)), "{args:?}");
         }
     }
 

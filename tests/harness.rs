@@ -362,14 +362,18 @@ fn passes_every_argument_through_and_exits_with_the_childs_status() {
     assert_eq!(starts.len(), 1);
     let s = &starts[0];
     assert_eq!(s.build, id);
-    // A fresh session: the harness put `--session-id <uuid>` in front, then every argument.
+    // A fresh session: the harness put `--session-id <uuid>` in front, then the launcher's yolo
+    // default, then every argument.
     assert_eq!(s.argv[0], "--session-id");
     assert!(
         grok_alab::lanes::is_session_uuid(&s.argv[1]),
         "{:?}",
         s.argv
     );
-    assert_eq!(&s.argv[2..], ["--model", "grok-4", "hello world"]);
+    assert_eq!(
+        &s.argv[2..],
+        ["--always-approve", "--model", "grok-4", "hello world"]
+    );
     assert_eq!(s.autoupdater, "1", "the vendor's self-update stays off");
     assert_eq!(s.harness, h.pid.to_string());
     assert!(!rig.log_text().contains("PATH grok ran"));
@@ -388,8 +392,10 @@ fn a_subcommand_runs_exactly_as_typed() {
     assert_eq!(rig.starts()[0].argv, ["sessions", "list"]);
 }
 
+/// `grok update` is aterm's package manager's (`tests/run.rs`, `run_intercepts_self_update`):
+/// with no `aterm` on `PATH` it is refused, never handed to grok's own updater.
 #[test]
-fn grok_update_is_refused_in_favour_of_atpkg() {
+fn grok_update_with_no_aterm_on_path_is_refused_never_run() {
     let (rig, _) = rig_v1("update");
     let out = never_starts(&rig, &["update"]);
     assert_eq!(out.status.code(), Some(2));
@@ -935,7 +941,10 @@ fn a_child_that_honours_the_term_after_the_grace_is_moved_when_nobody_typed_sinc
     assert!(rig.log_text().contains(&format!("term build={id1}")));
     let second = rig.starts()[1].clone();
     assert_eq!(second.build, id2);
-    assert_eq!(second.argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        second.argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     assert!(
         rig.journal_text()
             .contains("RELAUNCHED grok 1.0.70 -> 1.0.71 as pid"),
@@ -1022,7 +1031,10 @@ fn a_move_onto_a_build_that_refuses_to_start_resumes_on_the_previous_build() {
     let starts = rig.starts();
     assert_eq!(starts[1].build, id2);
     assert_eq!(starts[2].build, id1, "back on the build it ran");
-    assert_eq!(starts[2].argv, ["--resume", session.as_str()]);
+    assert_eq!(
+        starts[2].argv,
+        ["--always-approve", "--resume", session.as_str()]
+    );
     assert!(
         rig.journal_text()
             .contains("FAILED the move onto grok 1.0.71 failed: it ended (exit 3)"),
@@ -1220,7 +1232,11 @@ fn a_build_that_turns_out_to_be_the_harness_mid_move_is_skipped_for_the_target()
 fn a_launch_the_harness_cannot_carry_is_run_as_typed_and_never_relaunched() {
     let (rig, _) = rig_v1("uncarried");
     let (mut h, pty) = start_on_pty(&rig, &["--continue"], &FAST);
-    assert_eq!(rig.starts()[0].argv, ["--continue"], "nothing injected");
+    assert_eq!(
+        rig.starts()[0].argv,
+        ["--always-approve", "--continue"],
+        "no session id injected, only the launcher's yolo default"
+    );
     let id2 = rig.install(V2);
     rig.make_current(id2);
     assert!(wait_until(END, || rig
@@ -1274,24 +1290,6 @@ fn with_no_terminal_the_harness_never_relaunches() {
     let _ = sh.wait();
 }
 
-/// Lays a fake `aterm` on the rig's PATH that records each call and exits
-/// `$FAKE_ATERM_EXIT` (default 0); returns the calls file.
-fn fake_aterm(rig: &Rig) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let calls = rig.root.join("aterm.calls");
-    let aterm = rig.path_dir.join("aterm");
-    std::fs::write(
-        &aterm,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit \"${{FAKE_ATERM_EXIT:-0}}\"\n",
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    calls
-}
-
 /// One launch to its end with no terminal under aterm (`ATERM_CHILD=1`), the fake grok told
 /// to exit at once.
 fn under_aterm(rig: &Rig, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
@@ -1308,7 +1306,7 @@ fn under_aterm_a_signed_out_interactive_launch_is_signed_in_by_aterm_first() {
     let (rig, _) = rig_v1("signin");
     // The rig starts signed in (its login file); this test starts signed out.
     rig.sign_out();
-    let calls = fake_aterm(&rig);
+    let calls = rig.fake_aterm();
     let called = || std::fs::read_to_string(&calls).unwrap_or_default();
     let signin = "harness signin --cli grok --wait\n";
 

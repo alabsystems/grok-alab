@@ -307,10 +307,14 @@ fn claim_child(running: &Build, process: Option<ChildProcess>) -> Child<'_> {
 }
 
 /// The link's own clock, run on every pass of the loop: claim a lost link again, follow the
-/// policy, and drain the event stream. The restart aterm asked for, if one came.
+/// policy, and drain the event stream. The restart aterm asked for, if one came. A claim made
+/// again keeps to [`aterm::CONTRACTS`]: an aterm that came back serving no contract 4 is not
+/// claimed (`UNCLAIMED policy contract=2,3 declared=4`), grok runs on unclaimed, and the claim
+/// is made under 4 once aterm serves it (Decision 61).
 fn link_tick(link: &mut Link, child: Child<'_>, journal: &Journal) -> Option<Restart> {
     let now = aterm::now_ms();
     link.tick(child, now);
+    aterm::journal(link, journal);
     let drained = link.events(child, now);
     aterm::journal(link, journal);
     drained.restart

@@ -5,6 +5,6 @@
 id        = "grok-alab"
 tool      = "grok-alab"
 leads     = ["grok"]
-contracts = [3, 4]            # alab-wire claims at 4 where aterm serves it, else at 3
+contracts = [4]               # a record-bearing build never claims 3 (README, Decision 61)
 name      = "Grok Build"
 env_strip = ["GROK_", "XAI_"]

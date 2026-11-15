@@ -545,6 +545,60 @@ fn account_home() -> Option<PathBuf> {
     }
 }
 
+/// The record of who holds the store's writer lock, under the prefix (atpkg
+/// `lock::holder_path`).
+const HOLDER: &str = "store.lock.holder";
+
+/// The longest holder record read (atpkg `lock::read_holder`'s bound).
+const MAX_HOLDER_BYTES: u64 = 256;
+
+/// Whether the store's holder record names a person's own `aterm pkg` command in a live
+/// process (atpkg `lock::holder_is_person`): `<prefix>/store.lock.holder`, never a symlink, of
+/// at most 256 bytes, says `person=1` and a `pid=` that is alive. `grok update`'s line for a
+/// store held too long names that holder ([`crate::selfupdate::contended_line`]).
+#[must_use]
+pub fn holder_is_person(layout: &Layout) -> bool {
+    read_sidecar(&layout.prefix.join(HOLDER), MAX_HOLDER_BYTES)
+        .and_then(|text| holder(&text))
+        .is_some_and(|(pid, person)| person && alive(pid))
+}
+
+/// The pid and the person flag a holder record names, the last line of each kind deciding
+/// (atpkg `lock::read_holder`): `None` unless both are there and the pid is all digits.
+#[must_use]
+pub fn holder(text: &str) -> Option<(u32, bool)> {
+    let mut pid = None;
+    let mut person = None;
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("pid", v)) => {
+                let v = v.trim();
+                pid = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| v.parse::<u32>().ok())
+                    .flatten();
+            }
+            Some(("person", v)) => person = Some(v.trim() == "1"),
+            _ => {}
+        }
+    }
+    Some((pid?, person?))
+}
+
+/// Whether `pid` names a live process: a signal 0 it takes, or one it may not be sent
+/// (`EPERM`, another user's process), as aterm's `pid_alive` reads it.
+fn alive(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => true,
+        Err(e) => e == rustix::io::Errno::PERM,
+    }
+}
+
 /// Whether `path` (followed) is a regular file with an execute bit.
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
