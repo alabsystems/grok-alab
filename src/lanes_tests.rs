@@ -323,3 +323,44 @@ fn every_measured_option_is_in_the_table_once() {
         assert!(flag(long).is_some(), "{long} missing");
     }
 }
+
+/// aterm's `restart cause=… model=<word>`: every model option the launch kept gives way to the
+/// one aterm named, in each spelling clap reads, and nothing else the launch kept moves. A value
+/// that reads like `-m` (another option's argument) is not the model option.
+#[test]
+fn a_model_restart_replaces_every_model_option_and_keeps_the_rest() {
+    let carried = |kept: &[&str]| Carried {
+        session: "00000000-0000-4000-8000-000000000001".to_string(),
+        kept: kept.iter().map(|k| (*k).to_string()).collect(),
+        injected: vec![],
+    };
+    for (kept, want) in [
+        (&[][..], &["--model=grok-4"][..]),
+        (&["-m", "grok-3"], &["--model=grok-4"]),
+        (
+            &["--always-approve", "--model", "grok-3", "--cwd", "/w"],
+            &["--always-approve", "--cwd", "/w", "--model=grok-4"],
+        ),
+        (
+            &["--model=grok-3", "-m", "grok-code-fast-1"],
+            &["--model=grok-4"],
+        ),
+        (
+            &["--system-prompt", "-m", "--debug"],
+            &["--system-prompt", "-m", "--debug", "--model=grok-4"],
+        ),
+    ] {
+        let moved = carried(kept).with_model("grok-4");
+        assert_eq!(moved.kept, want, "{kept:?}");
+        assert_eq!(moved.session, carried(kept).session);
+        assert_eq!(
+            moved.relaunch_argv()[want.len()..],
+            ["--resume", "00000000-0000-4000-8000-000000000001"]
+        );
+    }
+    // Moved again, the earlier move's model is replaced too.
+    let twice = carried(&["-m", "grok-3"])
+        .with_model("grok-4")
+        .with_model("grok-5");
+    assert_eq!(twice.kept, ["--model=grok-5"]);
+}

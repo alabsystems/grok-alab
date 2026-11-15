@@ -7,12 +7,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Harness, Pty, Rig, exists, ps_state, signal_pid, wait_until};
+use common::{END, Harness, Pty, Rig, exists, ps_state, signal_pid, ticks, wait_until, wait_up};
 
 const V1: (u64, u64, u64) = (1, 0, 70);
 const V2: (u64, u64, u64) = (1, 0, 71);
 const V3: (u64, u64, u64) = (1, 0, 72);
-const END: Duration = Duration::from_secs(10);
 
 /// The harness's own version, as `--version` and the journal print it (never a literal: a
 /// `pub bump` must not turn the suite red).
@@ -39,7 +38,8 @@ fn rig_v1(name: &str) -> (Rig, u64) {
     (rig, id)
 }
 
-/// Start the harness on a pty with fast timings, and wait for the fake's first start line.
+/// Start the harness on a pty with fast timings, and wait for the fake's first start line and
+/// its `up` (or its end, for a fake that exits at once).
 fn start_on_pty(rig: &Rig, args: &[&str], env: &[(&str, &str)]) -> (Harness, Pty) {
     let mut pty = Pty::new();
     let mut cmd = rig.command(args);
@@ -54,7 +54,42 @@ fn start_on_pty(rig: &Rig, args: &[&str], env: &[(&str, &str)]) -> (Harness, Pty
         "the fake never started; journal:\n{}",
         rig.journal_text()
     );
+    wait_up(&pty, rig.starts()[0].pid);
     (h, pty)
+}
+
+/// How many requests the harness has refused for want of a newer build.
+fn no_newer_refusals(rig: &Rig) -> usize {
+    rig.journal_text()
+        .matches("HOLD safe point refused: no newer grok build")
+        .count()
+}
+
+/// Wait until the harness has read every signal sent to it before this call. With no newer
+/// build installed, a SIGUSR1 is refused in the journal; the harness reads its signals in the
+/// order they came (and a signal it did not catch acts before the next is read), so once that
+/// refusal is written every earlier signal was read, and acted on if it was going to be.
+fn harness_read_its_signals(h: &Harness, rig: &Rig) {
+    let before = no_newer_refusals(rig);
+    h.signal(libc::SIGUSR1);
+    assert!(
+        wait_until(END, || no_newer_refusals(rig) > before),
+        "the harness never answered the SIGUSR1; journal:\n{}",
+        rig.journal_text()
+    );
+}
+
+/// Wait until the fake `child` has run every trap for the signals sent to it before this call:
+/// a typed line it reads on USR2 is logged after them (bash runs pending traps in signal-number
+/// order, and USR2 is numbered above HUP, INT and TERM).
+fn child_ran_its_traps(pty: &Pty, rig: &Rig, child: i32, mark: &str) {
+    pty.type_input(format!("{mark}\n").as_bytes());
+    signal_pid(child, libc::SIGUSR2);
+    assert!(
+        wait_until(END, || rig.log_text().contains(&format!("line={mark}"))),
+        "the fake never read the line; log:\n{}",
+        rig.log_text()
+    );
 }
 
 /// Run the harness to its end with no terminal, for a launch that must never start the
@@ -412,11 +447,14 @@ fn hup_is_passed_on() {
 #[test]
 fn int_and_quit_belong_to_the_child_and_the_harness_ignores_them() {
     let (rig, _) = rig_v1("int");
-    let (mut h, _pty) = start_on_pty(&rig, &[], &[]);
+    let (mut h, pty) = start_on_pty(&rig, &[], &[]);
     let child = rig.starts()[0].pid;
     h.signal(libc::SIGINT);
     h.signal(libc::SIGQUIT);
-    std::thread::sleep(Duration::from_millis(500));
+    // Not a window: the harness answers a later signal, so it read these two, and the fake
+    // runs a later trap, so a copy passed on to it would have been logged by then.
+    harness_read_its_signals(&h, &rig);
+    child_ran_its_traps(&pty, &rig, child, "after int");
     assert!(h.alive(), "the harness died of INT/QUIT");
     assert!(exists(child), "the child died");
     assert!(
@@ -452,10 +490,14 @@ fn a_hup_ignored_at_start_stays_ignored_in_the_harness_and_its_child() {
         "the fake never started; journal:\n{}",
         rig.journal_text()
     );
+    wait_up(&pty, rig.starts()[0].pid);
     let child = rig.starts()[0].pid;
     h.signal(libc::SIGHUP);
     signal_pid(child, libc::SIGHUP);
-    std::thread::sleep(Duration::from_millis(500));
+    // Not a window: the harness answers a later signal and the fake runs a later trap, so a
+    // HUP either caught would have shown by then.
+    harness_read_its_signals(&h, &rig);
+    child_ran_its_traps(&pty, &rig, child, "after hup");
     still_up(&mut h, &rig);
     assert!(
         !rig.log_text().contains("hup build="),
@@ -512,10 +554,22 @@ const FAST: [(&str, &str); 2] = [
     ("GROK_ALAB_HUMAN_GRACE_MS", "300"),
 ];
 
+/// The quiet [`FAST`] asks for, each way.
+const FAST_QUIET: Duration = Duration::from_millis(300);
+
+/// Wait until the terminal has been quiet past both [`FAST`] gates, so a request sent now is
+/// held by nothing but what the test set up.
+fn settle(pty: &Pty) {
+    assert!(
+        pty.wait_quiet(FAST_QUIET, FAST_QUIET),
+        "the terminal never went quiet: {:?}",
+        pty.quiet()
+    );
+}
 #[test]
 fn a_newer_build_takes_over_at_a_safe_point_with_the_resume_argv_and_the_harness_never_exits() {
     let (rig, id1) = rig_v1("relaunch");
-    let (mut h, _pty) = start_on_pty(&rig, &["--always-approve", "first prompt"], &FAST);
+    let (mut h, pty) = start_on_pty(&rig, &["--always-approve", "first prompt"], &FAST);
     let first = rig.starts()[0].clone();
     assert_eq!(first.build, id1);
     assert_eq!(first.argv[0], "--session-id");
@@ -527,7 +581,7 @@ fn a_newer_build_takes_over_at_a_safe_point_with_the_resume_argv_and_the_harness
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
 
     assert!(
@@ -571,13 +625,16 @@ fn a_newer_build_takes_over_at_a_safe_point_with_the_resume_argv_and_the_harness
 #[test]
 fn without_a_safe_point_request_a_newer_build_waits() {
     let (rig, _) = rig_v1("norequest");
-    let (mut h, _pty) = start_on_pty(&rig, &[], &FAST);
+    let (mut h, pty) = start_on_pty(&rig, &[], &FAST);
     let id2 = rig.install(V2);
     rig.make_current(id2);
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(1500));
+    // Every gate a move needs has passed (the terminal quiet past both), so a harness that
+    // moved without a request would move on its next tick. Watch twenty of them.
+    settle(&pty);
+    std::thread::sleep(ticks(20));
     assert_eq!(rig.starts().len(), 1, "moved with no request");
     assert!(!rig.log_text().contains("term build="));
     still_up(&mut h, &rig);
@@ -588,7 +645,7 @@ fn without_a_safe_point_request_a_newer_build_waits() {
 #[test]
 fn never_relaunches_while_a_tool_process_runs_under_grok() {
     let (rig, _) = rig_v1("busychild");
-    let (mut h, _pty) = start_on_pty(
+    let (mut h, pty) = start_on_pty(
         &rig,
         &[],
         &[FAST[0], FAST[1], ("FAKE_GROK_MODE", "busy-child")],
@@ -598,14 +655,15 @@ fn never_relaunches_while_a_tool_process_runs_under_grok() {
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("HOLD safe point refused")));
     let journal = rig.journal_text();
     assert!(journal.contains("process(es) run under grok"), "{journal}");
-    std::thread::sleep(Duration::from_millis(300));
+    // The refusal is that tick's whole answer; watch ten more ticks for a TERM all the same.
+    std::thread::sleep(ticks(10));
     assert!(
         !rig.log_text().contains("term build="),
         "a busy child was ended"
@@ -620,7 +678,7 @@ fn never_relaunches_while_a_tool_process_runs_under_grok() {
 fn never_relaunches_while_grok_is_drawing() {
     let (rig, _) = rig_v1("busyoutput");
     // The fake draws a dot every second; quiet needs three.
-    let (mut h, _pty) = start_on_pty(
+    let (mut h, pty) = start_on_pty(
         &rig,
         &[],
         &[
@@ -634,7 +692,8 @@ fn never_relaunches_while_grok_is_drawing() {
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    // Only the input gate is waited for: the drawing is what must hold the move.
+    assert!(pty.wait_quiet(FAST_QUIET, Duration::ZERO));
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
@@ -650,13 +709,16 @@ fn never_relaunches_while_grok_is_drawing() {
 #[test]
 fn never_relaunches_while_someone_is_typing() {
     let (rig, id1) = rig_v1("typing");
-    let grace = Duration::from_millis(1500);
+    // The typing must still be inside the grace when the request is read: the time from the
+    // fake's read to the harness's answer is the test's own steps, which a loaded machine
+    // stretches, so the grace is wide.
+    let grace = Duration::from_millis(3000);
     let (mut h, pty) = start_on_pty(
         &rig,
         &[],
         &[
             ("GROK_ALAB_QUIET_MS", "300"),
-            ("GROK_ALAB_HUMAN_GRACE_MS", "1500"),
+            ("GROK_ALAB_HUMAN_GRACE_MS", "3000"),
         ],
     );
     let fake = rig.starts()[0].pid;
@@ -667,7 +729,7 @@ fn never_relaunches_while_someone_is_typing() {
         .contains("SEEN grok 1.0.71")));
     // Let the input quiet pass the grace first (the idle fake never reads its terminal), so
     // only the typing below can hold the move.
-    std::thread::sleep(grace + Duration::from_millis(300));
+    assert!(pty.wait_quiet(grace, FAST_QUIET), "{:?}", pty.quiet());
     pty.type_input(b"half a thought\n");
     // As a TUI does once its terminal polls readable: the fake reads the typed line.
     signal_pid(fake, libc::SIGUSR2);
@@ -691,7 +753,7 @@ fn never_relaunches_while_someone_is_typing() {
     still_up(&mut h, &rig);
     // The control: nothing changes but the clock, and once the grace has passed with nothing
     // more typed the same request moves. The hold above was the typing, nothing else.
-    std::thread::sleep(grace + Duration::from_millis(300));
+    assert!(pty.wait_quiet(grace, FAST_QUIET), "{:?}", pty.quiet());
     h.signal(libc::SIGUSR1);
     assert!(
         wait_until(END, || rig.starts().len() == 2),
@@ -707,7 +769,7 @@ fn never_relaunches_while_someone_is_typing() {
 #[test]
 fn a_child_that_ignores_the_harness_term_is_never_killed_harder() {
     let (rig, _) = rig_v1("ignoreterm");
-    let (mut h, _pty) = start_on_pty(
+    let (mut h, pty) = start_on_pty(
         &rig,
         &[],
         &[
@@ -723,7 +785,7 @@ fn a_child_that_ignores_the_harness_term_is_never_killed_harder() {
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig.log_text().contains("term-ignored")));
     assert!(
@@ -734,8 +796,9 @@ fn a_child_that_ignores_the_harness_term_is_never_killed_harder() {
         rig.journal_text()
     );
     // Well past the grace: the child still runs on its build, was sent nothing harder, and
-    // no second grok started.
-    std::thread::sleep(Duration::from_millis(1500));
+    // no second grok started. Watched for three graces more, counted from the harness's own
+    // word that the grace ran out.
+    std::thread::sleep(Duration::from_millis(500) * 3);
     assert!(
         exists(child) && !ps_state(child).contains('Z'),
         "the child was killed"
@@ -751,8 +814,92 @@ fn a_child_that_ignores_the_harness_term_is_never_killed_harder() {
     assert_eq!(exit_code(h.wait_end(END)), Some(0));
 }
 
-/// A late answer to the harness's SIGTERM finishes the move: grok exits 0 two to three seconds
-/// after it (past the 300 ms grace), nobody typed since, so the session is relaunched on the new
+/// TIME STOPPED IS NOT GRACE (Decision 39): after the harness's own SIGTERM for a move, a child
+/// that is stopped (alone, which stops the harness after it; or with its whole job, a stop the
+/// harness never reads) past the grace and then continued gets the whole grace again, rather
+/// than being read as one that ignored the SIGTERM the moment it runs.
+#[test]
+fn a_child_stopped_past_the_grace_gets_the_grace_again_once_continued() {
+    for whole_job in [false, true] {
+        let (rig, _) = rig_v1("stoppedgrace");
+        // A shell job: the harness leads a process group of its own, so the group can be
+        // stopped and continued as a shell does.
+        let mut pty = Pty::new();
+        let mut cmd = rig.command(&[]);
+        for (k, v) in [
+            FAST[0],
+            FAST[1],
+            ("GROK_ALAB_EXIT_GRACE_MS", "4000"),
+            ("FAKE_GROK_MODE", "ignore-term"),
+        ] {
+            cmd.env(k, v);
+        }
+        pty.attach(&mut cmd);
+        let mut h = Harness::spawn_in_own_group(&mut cmd);
+        pty.release_slave();
+        assert!(wait_until(END, || !rig.starts().is_empty()));
+        let child = rig.starts()[0].pid;
+        wait_up(&pty, child);
+        let id2 = rig.install(V2);
+        rig.make_current(id2);
+        assert!(wait_until(END, || rig
+            .journal_text()
+            .contains("SEEN grok 1.0.71")));
+        settle(&pty);
+        h.signal(libc::SIGUSR1);
+        assert!(
+            wait_until(END, || rig.journal_text().contains("MOVE safe point")),
+            "{}",
+            rig.journal_text()
+        );
+        // The stop must come inside the grace (the test's steps from the MOVE line to the
+        // stop), and the grace is wide so a loaded machine cannot outrun it.
+        let grace = Duration::from_millis(4000);
+        let sent = std::time::Instant::now();
+        if whole_job {
+            h.signal_group(libc::SIGSTOP);
+        } else {
+            signal_pid(child, libc::SIGSTOP);
+        }
+        assert!(
+            h.wait_stopped(END),
+            "whole_job={whole_job}: the harness did not stop"
+        );
+        // Stopped well past the grace (the time passing is the point here), then continued
+        // as `fg` does.
+        std::thread::sleep((grace + Duration::from_secs(1)).saturating_sub(sent.elapsed()));
+        assert!(
+            !rig.journal_text().contains("did not exit within"),
+            "whole_job={whole_job}: the grace ran out before the stop; journal:\n{}",
+            rig.journal_text()
+        );
+        let continued = std::time::Instant::now();
+        h.signal_group(libc::SIGCONT);
+        // Not a window: the harness restarts the grace when it reads the continue, which is
+        // after this test sent it, so the grace runs out no sooner than a whole grace after
+        // `continued`. Time stopped counted as grace would end it on the first tick instead.
+        assert!(
+            wait_until(END, || rig
+                .journal_text()
+                .contains("did not exit within 4000 ms")),
+            "whole_job={whole_job}: the grace never ran out; journal:\n{}",
+            rig.journal_text()
+        );
+        assert!(
+            continued.elapsed() >= grace,
+            "whole_job={whole_job}: the time stopped was counted as grace (it ran out {:?} after the continue); journal:\n{}",
+            continued.elapsed(),
+            rig.journal_text()
+        );
+        assert!(exists(child) && !ps_state(child).contains('T'));
+        still_up(&mut h, &rig);
+        h.signal(libc::SIGHUP);
+        assert_eq!(exit_code(h.wait_end(END)), Some(0), "whole_job={whole_job}");
+    }
+}
+
+/// A late answer to the harness's SIGTERM finishes the move: grok exits 0 once the harness has
+/// said the 300 ms grace ran out, nobody typed since, so the session is relaunched on the new
 /// build with its resume argv, and nothing is left for the person to do.
 #[test]
 fn a_child_that_honours_the_term_after_the_grace_is_moved_when_nobody_typed_since() {
@@ -765,7 +912,7 @@ fn a_child_that_honours_the_term_after_the_grace_is_moved_when_nobody_typed_sinc
             FAST[0],
             FAST[1],
             ("GROK_ALAB_EXIT_GRACE_MS", "300"),
-            (only_v1.as_str(), "slow-term:3"),
+            (only_v1.as_str(), "held-term"),
         ],
     );
     let session = rig.starts()[0].argv[1].clone();
@@ -774,11 +921,12 @@ fn a_child_that_honours_the_term_after_the_grace_is_moved_when_nobody_typed_sinc
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("did not exit within 300 ms")));
+    rig.release_term();
     assert!(
         wait_until(END, || rig.starts().len() == 2),
         "the late exit ended the session; journal:\n{}",
@@ -814,7 +962,7 @@ fn a_late_exit_after_someone_typed_ends_the_session_and_says_how_to_resume() {
             FAST[0],
             FAST[1],
             ("GROK_ALAB_EXIT_GRACE_MS", "300"),
-            ("FAKE_GROK_MODE", "slow-term:3"),
+            ("FAKE_GROK_MODE", "held-term"),
         ],
     );
     let first = rig.starts()[0].clone();
@@ -824,7 +972,7 @@ fn a_late_exit_after_someone_typed_ends_the_session_and_says_how_to_resume() {
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
@@ -832,6 +980,7 @@ fn a_late_exit_after_someone_typed_ends_the_session_and_says_how_to_resume() {
     pty.type_input(b"/exit\n");
     signal_pid(first.pid, libc::SIGUSR2);
     assert!(wait_until(END, || rig.log_text().contains("line=/exit")));
+    rig.release_term();
     assert_eq!(exit_code(h.wait_end(END)), Some(0));
     assert_eq!(rig.starts().len(), 1, "{}", rig.journal_text());
     let hint = format!("grok --resume {session}");
@@ -856,14 +1005,14 @@ fn a_move_onto_a_build_that_refuses_to_start_resumes_on_the_previous_build() {
     let (rig, id1) = rig_v1("refused-move");
     let id2 = common::vendor_id(V2.0, V2.1, V2.2);
     let only_v2 = format!("FAKE_GROK_MODE_{id2}");
-    let (mut h, _pty) = start_on_pty(&rig, &[], &[FAST[0], FAST[1], (only_v2.as_str(), "exit:3")]);
+    let (mut h, pty) = start_on_pty(&rig, &[], &[FAST[0], FAST[1], (only_v2.as_str(), "exit:3")]);
     let session = rig.starts()[0].argv[1].clone();
     assert_eq!(rig.install(V2), id2);
     rig.make_current(id2);
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(
         wait_until(END, || rig.starts().len() == 3),
@@ -882,7 +1031,7 @@ fn a_move_onto_a_build_that_refuses_to_start_resumes_on_the_previous_build() {
     );
     still_up(&mut h, &rig);
     // The failed build is not moved onto again.
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
@@ -897,14 +1046,14 @@ fn a_move_onto_a_build_that_refuses_to_start_resumes_on_the_previous_build() {
 #[test]
 fn no_move_while_grok_would_start_signed_out() {
     let (rig, _) = rig_v1("move-signed-out");
-    let (mut h, _pty) = start_on_pty(&rig, &[], &FAST);
+    let (mut h, pty) = start_on_pty(&rig, &[], &FAST);
     let id2 = rig.install(V2);
     rig.make_current(id2);
     rig.sign_out();
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(
         wait_until(END, || rig.journal_text().contains(
@@ -938,7 +1087,7 @@ fn after_an_unanswered_term_a_later_move_still_works_and_a_later_quit_is_not_bla
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(
         wait_until(END, || rig
@@ -964,7 +1113,8 @@ fn after_an_unanswered_term_a_later_move_still_works_and_a_later_quit_is_not_bla
     // SIGTERM of the harness ended it.
     signal_pid(second.pid, libc::SIGHUP);
     assert_eq!(exit_code(h.wait_end(END)), Some(0));
-    std::thread::sleep(Duration::from_millis(200));
+    // Everything the harness wrote before it ended is read before the screen is.
+    assert!(pty.wait_drained(), "the terminal was never closed");
     let screen = String::from_utf8_lossy(&pty.output.lock().unwrap()).into_owned();
     assert!(!screen.contains("--resume"), "{screen}");
     assert!(!rig.journal_text().contains("unanswered SIGTERM"));
@@ -973,7 +1123,7 @@ fn after_an_unanswered_term_a_later_move_still_works_and_a_later_quit_is_not_bla
 #[test]
 fn never_moves_onto_a_build_that_is_the_harness_itself() {
     let (rig, _) = rig_v1("selfmove");
-    let (mut h, _pty) = start_on_pty(&rig, &[], &FAST);
+    let (mut h, pty) = start_on_pty(&rig, &[], &FAST);
     let id2 = rig.install(V2);
     let bin = rig
         .program_dir()
@@ -990,7 +1140,7 @@ fn never_moves_onto_a_build_that_is_the_harness_itself() {
         "{}",
         rig.journal_text()
     );
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
@@ -1011,17 +1161,19 @@ fn never_moves_onto_a_build_that_is_the_harness_itself() {
 
 #[test]
 fn a_build_that_turns_out_to_be_the_harness_mid_move_is_skipped_for_the_target() {
-    // The move targets 1.0.71; while grok takes a second or two to exit, `current` flips to a 1.0.72
-    // that is the harness itself. The relaunch goes to 1.0.71, never to the harness.
+    // The move targets 1.0.71; while grok holds the harness's SIGTERM, `current` flips to a 1.0.72
+    // that is the harness itself, and grok exits once the harness has seen the flip. The
+    // relaunch goes to 1.0.71, never to the harness. The grace only bounds how long the exit
+    // counts as the move's own, so it is a deadline, wide for a loaded machine.
     let (rig, _) = rig_v1("selfmidmove");
-    let (mut h, _pty) = start_on_pty(
+    let (mut h, pty) = start_on_pty(
         &rig,
         &[],
         &[
             FAST[0],
             FAST[1],
-            ("GROK_ALAB_EXIT_GRACE_MS", "5000"),
-            ("FAKE_GROK_MODE", "slow-term:2"),
+            ("GROK_ALAB_EXIT_GRACE_MS", "30000"),
+            ("FAKE_GROK_MODE", "held-term"),
         ],
     );
     let id2 = rig.install(V2);
@@ -1029,9 +1181,9 @@ fn a_build_that_turns_out_to_be_the_harness_mid_move_is_skipped_for_the_target()
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
-    assert!(wait_until(END, || rig.log_text().contains("term-slow")));
+    assert!(wait_until(END, || rig.log_text().contains("term-held")));
     let id3 = rig.install(V3);
     let bin = rig
         .program_dir()
@@ -1041,6 +1193,14 @@ fn a_build_that_turns_out_to_be_the_harness_mid_move_is_skipped_for_the_target()
     std::fs::remove_file(&bin).unwrap();
     std::os::unix::fs::symlink(common::HARNESS, &bin).unwrap();
     rig.make_current(id3);
+    assert!(
+        wait_until(END, || rig
+            .journal_text()
+            .contains("is this harness itself")),
+        "the flip was never seen; journal:\n{}",
+        rig.journal_text()
+    );
+    rig.release_term();
     assert!(
         wait_until(END, || rig.starts().len() == 2),
         "no relaunch; journal:\n{}",
@@ -1059,14 +1219,14 @@ fn a_build_that_turns_out_to_be_the_harness_mid_move_is_skipped_for_the_target()
 #[test]
 fn a_launch_the_harness_cannot_carry_is_run_as_typed_and_never_relaunched() {
     let (rig, _) = rig_v1("uncarried");
-    let (mut h, _pty) = start_on_pty(&rig, &["--continue"], &FAST);
+    let (mut h, pty) = start_on_pty(&rig, &["--continue"], &FAST);
     assert_eq!(rig.starts()[0].argv, ["--continue"], "nothing injected");
     let id2 = rig.install(V2);
     rig.make_current(id2);
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    settle(&pty);
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()
@@ -1101,7 +1261,7 @@ fn with_no_terminal_the_harness_never_relaunches() {
     assert!(wait_until(END, || rig
         .journal_text()
         .contains("SEEN grok 1.0.71")));
-    std::thread::sleep(Duration::from_millis(700));
+    // No quiet to wait for: with no terminal the request is refused whenever it comes.
     h.signal(libc::SIGUSR1);
     assert!(wait_until(END, || rig
         .journal_text()

@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,11 @@ pub const fn vendor_id(x: u64, y: u64, z: u64) -> u64 {
 /// `$FAKE_GROK_MODE_<build id>` says, else `$FAKE_GROK_MODE` (so one build can refuse to start
 /// while another runs).
 ///
+/// EVERY TRAP AND EVERY MODE'S STATE IS SET BEFORE THE START LINE: a test that has read a start
+/// line may signal that fake at once (a TERM that came before its trap would kill it rather
+/// than end it, and a busy child not yet started would let a move through). Only the modes that
+/// end it (`exit:<n>`, `signal:<sig>`) act after the start line, so their start is still logged.
+///
 /// IT IDLES WITHOUT TOUCHING ITS TERMINAL. MEASURED on macOS (2026-10-24, a pty): every
 /// `read(2)` of a terminal moves its access time, even one that returns no data (a
 /// non-blocking read, a read a timeout interrupts), while `select`, `poll` and `kqueue` waits
@@ -42,43 +47,63 @@ pub const fn vendor_id(x: u64, y: u64, z: u64) -> u64 {
 /// reads its terminal only when the test says input is waiting (USR2), as a TUI reads once
 /// its terminal polls readable. It ends when its harness is gone, and after 120 s anyway.
 ///
-/// `slow-term:<n>` honours TERM `n - 1` to `n` seconds late, from the idle loop: a trap that
-/// ran `sleep` itself never finished (MEASURED with macOS bash 3.2; the pending `read -t`
-/// alarm cutting the trap short is the likely cause).
+/// `held-term` logs a TERM and honours it only once the test says so ([`Rig::release_term`]),
+/// from the idle loop, so a late answer to the harness's SIGTERM comes when the test has seen
+/// what it must see first, never on a clock a loaded machine can outrun. (A trap that waited
+/// itself never finished: MEASURED with macOS bash 3.2; the pending `read -t` alarm cutting the
+/// trap short is the likely cause.)
 const FAKE: &str = r#"#!/bin/bash
 log="${FAKE_GROK_LOG:?}"
 mode="${FAKE_GROK_MODE_@BUILD@:-${FAKE_GROK_MODE:-idle}}"
 fifo="$log.idle.$$"
 mkfifo "$fifo" && exec 3<>"$fifo" && rm -f "$fifo" || exit 98
-printf 'start build=@BUILD@ pid=%s autoupdater=%s harness=%s depth=%s argv=' "$$" "${GROK_DISABLE_AUTOUPDATER-}" "${GROK_ALAB_PID-}" "${GROK_ALAB_DEPTH-}" >> "$log"
-for a in "$@"; do printf '[%s]' "$a" >> "$log"; done
-printf '\n' >> "$log"
 bg=
-term_at=
+held=
 on_term() { printf "term build=@BUILD@\n" >> "$log"; [ -n "$bg" ] && kill "$bg" 2>/dev/null; exit 0; }
 trap on_term TERM
 trap 'printf "hup build=@BUILD@\n" >> "$log"; [ -n "$bg" ] && kill "$bg" 2>/dev/null; exit 0' HUP
 trap 'printf "int build=@BUILD@\n" >> "$log"' INT
 trap 'IFS= read -r line; printf "read build=@BUILD@ line=%s\n" "$line" >> "$log"' USR2
 case "$mode" in
-  exit:*) exit "${mode#exit:}" ;;
-  signal:*) trap - INT TERM HUP USR2; kill -"${mode#signal:}" $$; exit 99 ;;
   busy-child) sleep 60 & bg=$! ;;
   ignore-term) trap 'printf "term-ignored build=@BUILD@\n" >> "$log"' TERM ;;
   term-once) trap 'printf "term-ignored build=@BUILD@\n" >> "$log"; trap on_term TERM' TERM ;;
-  slow-term:*) trap 'printf "term-slow build=@BUILD@\n" >> "$log"; term_at=$SECONDS' TERM ;;
+  held-term) trap 'printf "term-held build=@BUILD@\n" >> "$log"; held=1' TERM ;;
+esac
+printf 'start build=@BUILD@ pid=%s autoupdater=%s harness=%s depth=%s argv=' "$$" "${GROK_DISABLE_AUTOUPDATER-}" "${GROK_ALAB_PID-}" "${GROK_ALAB_DEPTH-}" >> "$log"
+for a in "$@"; do printf '[%s]' "$a" >> "$log"; done
+printf '\n' >> "$log"
+case "$mode" in
+  exit:*) exit "${mode#exit:}" ;;
+  signal:*) trap - INT TERM HUP USR2; kill -"${mode#signal:}" $$; exit 99 ;;
 esac
 printf 'fake grok @BUILD@ up\r\n'
 while :; do
   if [ "$mode" = busy-output ]; then printf '.'; fi
   read -t 1 -u 3 _
-  if [ -n "$term_at" ] && [ $((SECONDS - term_at)) -ge "${mode#slow-term:}" ]; then on_term; fi
+  if [ -n "$held" ] && [ -e "$log.release" ]; then on_term; fi
   kill -0 "${GROK_ALAB_PID:-$PPID}" 2>/dev/null || exit 0
   [ "$SECONDS" -ge 120 ] && exit 97
 done
 "#;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// The harness's poll as [`Rig::command`] sets it (`GROK_ALAB_POLL_MS`): one tick of its loop,
+/// on which it reads the store, its signals, its child and (under a claim) aterm.
+pub const POLL: Duration = Duration::from_millis(50);
+
+/// `n` ticks of the harness's loop: the window a test watches for something that must NOT
+/// happen. A window proves an absence only for the ticks the harness ran in it, so it is
+/// counted in the harness's own ticks, and is no stand-in for a state that can be waited on.
+pub fn ticks(n: u32) -> Duration {
+    POLL * n
+}
+
+/// The deadline of every wait for a condition: a passing wait returns as soon as its condition
+/// holds, so the ceiling costs nothing, and a loaded machine (a build beside the suite) can
+/// take seconds over a step that takes milliseconds alone.
+pub const END: Duration = Duration::from_secs(30);
 
 /// One test's scratch: a store prefix (with a space in it, as the real one has), a state
 /// dir, a home and the fake's log.
@@ -188,6 +213,11 @@ impl Rig {
         fs::rename(&tmp, pd.join("current")).unwrap();
     }
 
+    /// Let a `held-term` fake honour the TERM it holds (on its next idle tick).
+    pub fn release_term(&self) {
+        fs::write(format!("{}.release", self.log.display()), "").unwrap();
+    }
+
     pub fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -213,7 +243,7 @@ impl Rig {
             .env("HOME", &self.home)
             .env("GROK_ALAB_PKG_PREFIX", &self.prefix)
             .env("GROK_ALAB_STATE_DIR", &self.state)
-            .env("GROK_ALAB_POLL_MS", "50")
+            .env("GROK_ALAB_POLL_MS", POLL.as_millis().to_string())
             .env("FAKE_GROK_LOG", &self.log);
         cmd
     }
@@ -271,7 +301,11 @@ impl Start {
 pub struct Pty {
     pub master: Arc<OwnedFd>,
     slave: Option<OwnedFd>,
+    /// The slave's device path, whose times the harness reads its quiet from.
+    slave_path: PathBuf,
     pub output: Arc<Mutex<Vec<u8>>>,
+    /// Set once the master reads end of file: every slave is closed and its output drained.
+    drained: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -292,6 +326,16 @@ impl Pty {
         assert_eq!(rc, 0, "openpty");
         // SAFETY: both descriptors were just made by `openpty` and are owned by nothing else.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: `ttyname_r` writes at most `name.len()` bytes into the live local buffer.
+        let rc = unsafe { libc::ttyname_r(slave.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+        assert_eq!(rc, 0, "ttyname_r");
+        // SAFETY: on success `ttyname_r` wrote a NUL-terminated name into `name`.
+        let slave_path = PathBuf::from(
+            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        );
         // SAFETY: an all-zero termios is valid storage, filled by `tcgetattr`.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: termios calls on the slave this test owns, into the live local.
@@ -305,7 +349,12 @@ impl Pty {
         }
         let master = Arc::new(master);
         let output = Arc::new(Mutex::new(Vec::new()));
-        let (m2, out2) = (Arc::clone(&master), Arc::clone(&output));
+        let drained = Arc::new(AtomicBool::new(false));
+        let (m2, out2, done) = (
+            Arc::clone(&master),
+            Arc::clone(&output),
+            Arc::clone(&drained),
+        );
         std::thread::spawn(move || {
             // SAFETY: a second handle on the master the Arc keeps open; it is never closed
             // through this `File` (forgotten below).
@@ -319,12 +368,56 @@ impl Pty {
             }
             std::mem::forget(f);
             drop(m2);
+            done.store(true, Ordering::SeqCst);
         });
         Pty {
             master,
             slave: Some(slave),
+            slave_path,
             output,
+            drained,
         }
+    }
+
+    /// Everything the programs on the slave wrote so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    /// How long ago a program on the slave last read typed input and last wrote output, read
+    /// as the harness reads them (the slave's access and modification times,
+    /// `grok_alab::procs::tty_quiet`; a `stat` of its path reads the times an `fstat` of the
+    /// harness's stdin reads). macOS stamps them lazily, at the next `stat`, so an event only
+    /// ever reads as newer than it was, never older.
+    pub fn quiet(&self) -> (Duration, Duration) {
+        use std::os::unix::fs::MetadataExt as _;
+        let st = fs::metadata(&self.slave_path).unwrap();
+        let at = |secs: i64, nanos: i64| {
+            UNIX_EPOCH + Duration::new(u64::try_from(secs).unwrap(), u32::try_from(nanos).unwrap())
+        };
+        let now = SystemTime::now();
+        let age = |t: SystemTime| now.duration_since(t).unwrap_or(Duration::ZERO);
+        (
+            age(at(st.atime(), st.atime_nsec())),
+            age(at(st.mtime(), st.mtime_nsec())),
+        )
+    }
+
+    /// Wait until the terminal has carried no input for `input` and no output for `output`, as
+    /// the harness will read it at its next request: the state a move's quiet gates ask for.
+    /// The ages only grow while nothing moves the terminal, so a request sent after this
+    /// returns true finds both gates passed.
+    pub fn wait_quiet(&self, input: Duration, output: Duration) -> bool {
+        wait_until(END, || {
+            let (i, o) = self.quiet();
+            i >= input && o >= output
+        })
+    }
+
+    /// Wait until every program on the slave has closed it and the master has read all they
+    /// wrote (the harness and its children are gone).
+    pub fn wait_drained(&self) -> bool {
+        wait_until(END, || self.drained.load(Ordering::SeqCst))
     }
 
     /// Give the slave to `cmd` as its stdin, stdout and stderr.
@@ -473,6 +566,19 @@ pub fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// Wait until the fake with pid `pid` has said `up` on `pty` (every trap set, its first output
+/// written), or has ended without saying it (a mode that exits at once). Its answer is not
+/// needed: a fake that ended is the test's own business. (The terminal's output processing
+/// turns the fake's `\r\n` into `\r\r\n`, so the line is matched up to its first `\r`.)
+pub fn wait_up(pty: &Pty, pid: i32) {
+    let _ = wait_until(END, || {
+        pty.text().contains(" up\r") || {
+            let state = ps_state(pid);
+            state.is_empty() || state.contains('Z')
+        }
+    });
+}
+
 /// The `ps` state letters of `pid` (`T` when stopped), or empty when it is gone.
 pub fn ps_state(pid: i32) -> String {
     Command::new("/bin/ps")
@@ -510,386 +616,4 @@ pub fn os(v: &[&str]) -> Vec<OsString> {
 
 pub fn path_of(p: &Path) -> String {
     p.display().to_string()
-}
-
-/// A stand-in for aterm's control socket: the rendezvous directory's `graph/<sid>` entry, the
-/// socket and the token beside it, answering `harness policy`, `meta set|unset supervisor` and
-/// `status` from [`AtermState`], which a test changes as it goes, and streaming
-/// `subscribe @<sid> events` ([`FakeAterm::policy_event`]). It proves nothing itself: a claim
-/// is admitted when [`AtermState::claim_reply`] says `OK`, and is bound to its connection
-/// (released when that connection closes), as aterm binds one. [`FakeAterm::restart`] drops
-/// every connection and the claim, as an aterm restart does.
-pub struct FakeAterm {
-    /// `XDG_RUNTIME_DIR` for the harness (holds `aterm/graph/<sid>`).
-    pub xdg: PathBuf,
-    /// The short directory holding the socket and its token (a socket path has ~100 bytes).
-    pub sock_dir: PathBuf,
-    /// The session id.
-    pub sid: String,
-    /// What it answers, and what it was asked.
-    pub state: Arc<Mutex<AtermState>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// What a [`FakeAterm`] answers, and what it was asked.
-#[derive(Debug)]
-pub struct AtermState {
-    /// The whole `harness policy` reply.
-    pub policy: String,
-    /// The reply to `meta set supervisor …` (a claim is stored only when it is `OK`).
-    pub claim_reply: String,
-    /// Whether a stored claim reads `supervisor_proven=1`.
-    pub proven: bool,
-    /// The `status` fields besides `schema=`, `supervisor=` and `supervisor_proven=`.
-    pub screen: Vec<(String, String)>,
-    /// The live claim's holder, and the connection it is bound to.
-    pub supervisor: Option<(String, u32)>,
-    /// Every request line after the handshake, `@<sid>` included (subscriptions apart).
-    pub lines: Vec<String>,
-    /// Every `subscribe` line.
-    pub subscriptions: Vec<String>,
-    /// Whether `subscribe` is refused (an aterm that gives no event stream).
-    pub refuse_subscribe: bool,
-    /// The events pushed so far, in order, each a whole `EVENT …` line.
-    pub events: Vec<String>,
-    /// How many connections authenticated.
-    pub connections: u32,
-    /// Every live connection, so [`FakeAterm::restart`] can drop them.
-    streams: Vec<std::os::unix::net::UnixStream>,
-}
-
-/// aterm's policy reply with contract 3 served and every switch a move needs on.
-pub const POLICY_V3: &str = "OK gen=1 effective=on why=enabled contract=2,3 relaunch=true \
-     upgrade=true upgrade_ask=false human_grace_s=120 questions=ask";
-
-/// WHAT ATERM REPORTS FOR A GROK SESSION TODAY (aterm main, 2026-10-25): its Grok reader has no
-/// authoritative phase (`GrokReader::phase` is always a non-authoritative idle,
-/// `crates/aterm-phase/src/reader.rs`), which presence turns into `agent=unknown`
-/// (`crates/aterm-gui/src/presence.rs`), and `status` carries no `composer=`. Nobody typing or
-/// holding the session. Every test starts from this screen, so a move on aterm's read is never
-/// tested against a screen aterm does not send.
-pub const GROK_SCREEN: &[(&str, &str)] = &[
-    ("hold", "0"),
-    ("hand", "-"),
-    ("input", "clear"),
-    ("agent", "unknown"),
-    ("human_ms", "-"),
-    ("need", "-"),
-];
-
-/// A quiet screen as an aterm WITH A MEASURED GROK READER would report it (not shipped): the
-/// turn over (`agent=idle`), the composer empty (contract 3 item 9's `composer=`), nobody
-/// typing or holding the session.
-pub const READER_SCREEN: &[(&str, &str)] = &[
-    ("hold", "0"),
-    ("hand", "-"),
-    ("input", "clear"),
-    ("agent", "idle"),
-    ("composer", "empty"),
-    ("human_ms", "-"),
-    ("need", "-"),
-];
-
-const FAKE_TOKEN: &str = "fake-aterm-token";
-
-fn owned(screen: &[(&str, &str)]) -> Vec<(String, String)> {
-    screen
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
-}
-
-impl FakeAterm {
-    /// A fake aterm for session `s-<n>` under `rig`, answering `policy`, showing
-    /// [`GROK_SCREEN`].
-    pub fn new(rig: &Rig, policy: &str) -> FakeAterm {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let sid = format!("s-{:x}{n:x}", std::process::id());
-        let xdg = rig.root.join("xdg");
-        let graph = xdg.join("aterm").join("graph");
-        fs::create_dir_all(&graph).unwrap();
-        let sock_dir = std::env::temp_dir().join(format!("ga{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&sock_dir);
-        fs::create_dir_all(&sock_dir).unwrap();
-        let sock = sock_dir.join("c.sock");
-        fs::write(sock_dir.join("c.sock.token"), format!("{FAKE_TOKEN}\n")).unwrap();
-        fs::write(
-            graph.join(&sid),
-            format!("pid 1\nsock {}\n", sock.display()),
-        )
-        .unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let state = Arc::new(Mutex::new(AtermState {
-            policy: policy.to_string(),
-            claim_reply: "OK".to_string(),
-            proven: true,
-            screen: owned(GROK_SCREEN),
-            supervisor: None,
-            lines: Vec::new(),
-            subscriptions: Vec::new(),
-            refuse_subscribe: false,
-            events: Vec::new(),
-            connections: 0,
-            streams: Vec::new(),
-        }));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (st, sp) = (Arc::clone(&state), Arc::clone(&stop));
-        let sid2 = sid.clone();
-        std::thread::spawn(move || {
-            let mut id = 0_u32;
-            while !sp.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        id += 1;
-                        if let Ok(clone) = stream.try_clone() {
-                            st.lock().unwrap().streams.push(clone);
-                        }
-                        let (st, sp, sid) = (Arc::clone(&st), Arc::clone(&sp), sid2.clone());
-                        std::thread::spawn(move || serve(stream, id, &st, &sp, &sid));
-                    }
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
-        });
-        FakeAterm {
-            xdg,
-            sock_dir,
-            sid,
-            state,
-            stop,
-        }
-    }
-
-    /// The environment that puts the harness in this fake's tab.
-    pub fn env(&self) -> Vec<(String, String)> {
-        vec![
-            ("TERM_PROGRAM".to_string(), "aterm".to_string()),
-            ("ATERM_PARENT_SESSION_ID".to_string(), self.sid.clone()),
-            ("XDG_RUNTIME_DIR".to_string(), path_of(&self.xdg)),
-        ]
-    }
-
-    /// Set one `status` field.
-    pub fn set(&self, key: &str, value: &str) {
-        let mut st = self.state.lock().unwrap();
-        match st.screen.iter_mut().find(|(k, _)| k == key) {
-            Some(kv) => kv.1 = value.to_string(),
-            None => st.screen.push((key.to_string(), value.to_string())),
-        }
-    }
-
-    /// Make the `status` fields `base` with `changes` applied (`None` drops a field), in one
-    /// step, so no read ever sees a screen between the two.
-    pub fn screen_from(&self, base: &[(&str, &str)], changes: &[(&str, Option<&str>)]) {
-        let mut st = self.state.lock().unwrap();
-        st.screen = owned(base);
-        for (key, value) in changes {
-            st.screen.retain(|(k, _)| k != key);
-            if let Some(v) = value {
-                st.screen.push(((*key).to_string(), (*v).to_string()));
-            }
-        }
-    }
-
-    /// [`Self::screen_from`] [`READER_SCREEN`]: a screen only a measured Grok reader would give.
-    pub fn screen(&self, changes: &[(&str, Option<&str>)]) {
-        self.screen_from(READER_SCREEN, changes);
-    }
-
-    /// Drop one `status` field (an aterm that does not report it).
-    pub fn unset(&self, key: &str) {
-        self.state.lock().unwrap().screen.retain(|(k, _)| k != key);
-    }
-
-    /// Answer `harness policy` with `policy` from now on, and say so on every subscription
-    /// (`EVENT <sid> harness-policy gen=<n>`), as aterm does when its policy cell moves.
-    pub fn policy_event(&self, policy: &str) {
-        let mut st = self.state.lock().unwrap();
-        st.policy = policy.to_string();
-        let generation = st.events.len() + 2;
-        let line = format!("EVENT 1 harness-policy gen={generation}");
-        st.events.push(line);
-    }
-
-    /// Push any other event line (one the harness must read past).
-    pub fn event(&self, line: &str) {
-        self.state.lock().unwrap().events.push(line.to_string());
-    }
-
-    /// An aterm restart: every connection is dropped, and the claim with them.
-    pub fn restart(&self) {
-        let mut st = self.state.lock().unwrap();
-        st.supervisor = None;
-        for s in st.streams.drain(..) {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
-    }
-
-    /// The request lines so far, without the `@<sid> ` in front.
-    pub fn verbs(&self) -> Vec<String> {
-        let prefix = format!("@{} ", self.sid);
-        self.state
-            .lock()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|l| l.strip_prefix(&prefix).unwrap_or(l).to_string())
-            .collect()
-    }
-
-    /// The claims asked for so far.
-    pub fn claims(&self) -> Vec<String> {
-        self.verbs()
-            .into_iter()
-            .filter(|v| v.starts_with("meta set supervisor "))
-            .collect()
-    }
-
-    /// The live claim's holder.
-    pub fn holder(&self) -> Option<String> {
-        self.state
-            .lock()
-            .unwrap()
-            .supervisor
-            .clone()
-            .map(|(h, _)| h)
-    }
-
-    /// How many `subscribe` lines arrived.
-    pub fn subscriptions(&self) -> usize {
-        self.state.lock().unwrap().subscriptions.len()
-    }
-}
-
-impl Drop for FakeAterm {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let mut st = self.state.lock().unwrap();
-        for s in st.streams.drain(..) {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
-        drop(st);
-        let _ = fs::remove_dir_all(&self.sock_dir);
-    }
-}
-
-/// Stream the events pushed after this subscription began, until the client goes, the fake
-/// stops, or a restart drops the connection.
-fn stream_events(
-    mut out: std::os::unix::net::UnixStream,
-    state: &Arc<Mutex<AtermState>>,
-    stop: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::io::Write;
-    let mut sent = state.lock().unwrap().events.len();
-    while !stop.load(Ordering::Relaxed) {
-        let fresh: Vec<String> = {
-            let st = state.lock().unwrap();
-            st.events[sent.min(st.events.len())..].to_vec()
-        };
-        for line in &fresh {
-            if out.write_all(format!("{line}\n").as_bytes()).is_err() {
-                return;
-            }
-        }
-        sent += fresh.len();
-        // A dropped connection (a restart) ends the stream.
-        let mut probe = [0_u8; 1];
-        let _ = out.set_nonblocking(true);
-        match std::io::Read::read(&mut out, &mut probe) {
-            Ok(0) => return,
-            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return,
-            _ => {}
-        }
-        let _ = out.set_nonblocking(false);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn serve(
-    stream: std::os::unix::net::UnixStream,
-    id: u32,
-    state: &Arc<Mutex<AtermState>>,
-    stop: &Arc<std::sync::atomic::AtomicBool>,
-    sid: &str,
-) {
-    use std::io::{BufRead, BufReader, Write};
-    let _ = stream.set_nonblocking(false);
-    let mut out = stream.try_clone().unwrap();
-    let reader = BufReader::new(stream);
-    let mut authed = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        if !authed {
-            if line == format!("AUTH {FAKE_TOKEN}") {
-                authed = true;
-                state.lock().unwrap().connections += 1;
-                continue;
-            }
-            let _ = out.write_all(b"ERR auth\n");
-            break;
-        }
-        if line.starts_with("subscribe ") {
-            let refused = {
-                let mut st = state.lock().unwrap();
-                st.subscriptions.push(line.clone());
-                st.refuse_subscribe || line != format!("subscribe @{sid} events")
-            };
-            if refused {
-                let _ = out.write_all(b"ERR usage: subscribe\n");
-                break;
-            }
-            if out
-                .write_all(format!("OK subscribe 1\nsub 1 {sid}\n").as_bytes())
-                .is_err()
-            {
-                break;
-            }
-            stream_events(out, state, stop);
-            return;
-        }
-        let reply = {
-            let mut st = state.lock().unwrap();
-            if line == "version" {
-                "OK version=fake-aterm".to_string()
-            } else {
-                st.lines.push(line.clone());
-                let verb = line.split_once(' ').map_or("", |(_, v)| v).to_string();
-                if verb == "harness policy" {
-                    st.policy.clone()
-                } else if let Some(rest) = verb.strip_prefix("meta set supervisor ") {
-                    let reply = st.claim_reply.clone();
-                    if reply == "OK" {
-                        let holder = rest.split(' ').next().unwrap_or("").to_string();
-                        st.supervisor = Some((holder, id));
-                    }
-                    reply
-                } else if verb.starts_with("meta unset supervisor") {
-                    st.supervisor = None;
-                    "OK".to_string()
-                } else if verb == "status" {
-                    let mut s = "OK schema=1".to_string();
-                    for (k, v) in &st.screen {
-                        s.push_str(&format!(" {k}={v}"));
-                    }
-                    let (sup, proven) = match &st.supervisor {
-                        Some((h, _)) => (h.replace('@', "%40"), u8::from(st.proven)),
-                        None => ("-".to_string(), 0),
-                    };
-                    s.push_str(&format!(" supervisor={sup} supervisor_proven={proven}"));
-                    s
-                } else {
-                    "ERR unknown verb".to_string()
-                }
-            }
-        };
-        if out.write_all(format!("{reply}\n").as_bytes()).is_err() {
-            break;
-        }
-    }
-    let mut st = state.lock().unwrap();
-    if st.supervisor.as_ref().is_some_and(|(_, c)| *c == id) {
-        st.supervisor = None;
-    }
 }

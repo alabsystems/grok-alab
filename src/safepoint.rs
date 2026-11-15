@@ -7,15 +7,19 @@
 //! cannot tell by itself that a turn has ended, the composer is empty and nobody is typing.
 //! A move therefore needs a WITNESS for what only the screen shows ([`Witness`]):
 //!
-//! - **aterm's read** ([`Witness::Aterm`]), under a proven contract 3 claim
-//!   ([`crate::aterm`]): one fresh `status` and `harness policy` read, checked here against
-//!   every generic condition of aterm's harness design (`docs/DESIGN-harness-repos-2026-10-24.md`
-//!   §4.2), each holding the move when it fails or is not reported ([`screen_holds`]). No
+//! - **aterm's read** ([`Witness::Aterm`]), under a standing claim that takes `upgrade`
+//!   ([`crate::aterm`]): one fresh `status` and `harness policy` pair judged by `alab-wire`'s
+//!   safe-point rule (`alab_wire::claim::judge_safe_point`: the claim this harness's, proven
+//!   and taking `upgrade`; the policy in effect with `upgrade=true` and `upgrade_ask=false`;
+//!   `agent=idle`; `composer=empty` or `placeholder`; `human_ms` past the grace; `hand=-`,
+//!   `hold=0`, `input=clear`, `need=-`), every field aterm does not report holding the move. No
 //!   signal is needed: a newer build moves at the first read that passes.
 //! - **a request** ([`Witness::Request`]): `SIGUSR1` to the harness, which says "the session is
 //!   at a safe point now". Whoever sends it vouches for the screen; the terminal's input quiet
 //!   is checked in place of aterm's read. Outside aterm it is the only witness; under a claim it
-//!   stays as an override.
+//!   stays as the person's override, and aterm's facts must still show the claim this
+//!   harness's with `upgrade`, no halt and no other driver's hand
+//!   ([`crate::aterm::unheld`]).
 //!
 //! And every local gate below, each a necessary condition the harness checks itself, each
 //! holding the move (never forcing it) when it fails or cannot be read:
@@ -36,7 +40,6 @@
 
 use std::time::Duration;
 
-use crate::aterm::{Human, Policy, Screen};
 use crate::procs::TtyQuiet;
 
 /// How long the terminal must have written nothing (aterm `upgrade::QUIET_S`).
@@ -76,102 +79,13 @@ pub struct Facts {
 /// What vouches for what only the screen shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Witness {
-    /// A `SIGUSR1`: its sender vouches; the terminal's input quiet is checked.
-    Request,
-    /// aterm's read under a proven claim, or why there is none this time.
-    Aterm(Result<Box<AtermRead>, String>),
-}
-
-/// One fresh read of aterm: the session's `status` and its `harness policy`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AtermRead {
-    /// `status`.
-    pub screen: Screen,
-    /// `harness policy`.
-    pub policy: Policy,
-    /// This harness's holder word (`grok-alab@<pid>`).
-    pub holder: String,
-}
-
-/// Why aterm's read holds the move, or `None` when every generic condition of the safe point
-/// holds (aterm's harness design §4.2). A field aterm does not report holds the move.
-///
-/// `agent=` must be `idle`: aterm's `prompt` is a permission box (`program_state=blocked`), not
-/// a turn that ended, so it never passes, whatever the design's list says.
-#[must_use]
-pub fn screen_holds(r: &AtermRead) -> Option<String> {
-    let s = &r.screen;
-    if !s.held_by(&r.holder) {
-        return Some(format!(
-            "aterm does not show this harness's proven claim (supervisor={} supervisor_proven={})",
-            s.supervisor.as_deref().unwrap_or("-"),
-            u8::from(s.proven)
-        ));
-    }
-    if !r.policy.effective {
-        return Some(format!(
-            "aterm's harness policy is off here (why={})",
-            r.policy.why
-        ));
-    }
-    match r.policy.upgrade {
-        Some(true) => {}
-        Some(false) => return Some("[harness] upgrade = false".to_string()),
-        None => return Some("the policy reports no upgrade switch".to_string()),
-    }
-    match r.policy.upgrade_ask {
-        Some(false) => {}
-        Some(true) => {
-            return Some(
-                "[harness] upgrade_ask = true: a person says when (SIGUSR1 to the harness)"
-                    .to_string(),
-            );
-        }
-        None => return Some("the policy reports no upgrade_ask switch".to_string()),
-    }
-    match s.agent.as_deref() {
-        Some("idle") => {}
-        other => {
-            return Some(format!(
-                "aterm reads agent={} (a move needs idle: the turn over, no box, question, wall or survey)",
-                other.unwrap_or("absent")
-            ));
-        }
-    }
-    match s.composer.as_deref() {
-        Some("empty" | "placeholder") => {}
-        Some(other) => {
-            return Some(format!(
-                "aterm reads composer={other} (a draft is never dropped)"
-            ));
-        }
-        None => {
-            return Some(
-                "aterm reports no composer= (contract 3 item 9), so a draft cannot be ruled out"
-                    .to_string(),
-            );
-        }
-    }
-    let grace = r.policy.human_grace.unwrap_or(DEFAULT_HUMAN_GRACE);
-    match s.human {
-        Human::Never => {}
-        Human::Ago(ago) if ago >= grace => {}
-        Human::Ago(ago) => {
-            return Some(format!(
-                "a person typed {} ms ago (the grace is {} ms)",
-                ago.as_millis(),
-                grace.as_millis()
-            ));
-        }
-        Human::Unknown => return Some("aterm reports no human_ms".to_string()),
-    }
-    let exact = |key: &str, value: Option<&str>, want: &str| -> Option<String> {
-        (value != Some(want)).then(|| format!("aterm reads {key}={}", value.unwrap_or("absent")))
-    };
-    exact("hand", s.hand.as_deref(), "-")
-        .or_else(|| exact("hold", s.hold.as_deref(), "0"))
-        .or_else(|| exact("input", s.input.as_deref(), "clear"))
-        .or_else(|| exact("need", s.need.as_deref(), "-"))
+    /// A `SIGUSR1`: its sender vouches; the terminal's input quiet is checked. Under a claim,
+    /// aterm's word on a person's move (`Err`: the fact that holds it, `aterm hold=1`), else
+    /// `Ok`.
+    Request(Result<(), String>),
+    /// aterm's safe-point read under a standing claim with `upgrade`: `Ok` when it passed, else
+    /// the hold (`wait aterm agent=unknown`) or why there was no read.
+    Aterm(Result<(), String>),
 }
 
 /// The verdict on a request.
@@ -228,7 +142,7 @@ pub fn decide(f: &Facts) -> Decision {
         ));
     }
     match &f.witness {
-        Witness::Request => {
+        Witness::Request(word) => {
             if tty.input < f.human_grace {
                 return hold(format!(
                     "someone typed {} ms ago (the grace is {} ms)",
@@ -236,13 +150,12 @@ pub fn decide(f: &Facts) -> Decision {
                     f.human_grace.as_millis()
                 ));
             }
-        }
-        Witness::Aterm(Err(why)) => return hold(format!("no read of aterm: {why}")),
-        Witness::Aterm(Ok(read)) => {
-            if let Some(why) = screen_holds(read) {
-                return hold(why);
+            if let Err(why) = word {
+                return hold(why.clone());
             }
         }
+        Witness::Aterm(Err(why)) => return hold(why.clone()),
+        Witness::Aterm(Ok(())) => {}
     }
     Decision::Move
 }
@@ -266,27 +179,11 @@ mod tests {
             }),
             quiet: DEFAULT_QUIET,
             human_grace: DEFAULT_HUMAN_GRACE,
-            witness: Witness::Request,
+            witness: Witness::Request(Ok(())),
         }
     }
 
-    fn quiet_read() -> AtermRead {
-        AtermRead {
-            screen: Screen::parse(
-                "OK schema=1 supervisor=grok-alab@9 supervisor_proven=1 agent=idle \
-                 composer=empty human_ms=- hand=- hold=0 input=clear need=-",
-            )
-            .unwrap(),
-            policy: Policy::parse(
-                "OK gen=1 effective=on why=enabled contract=2,3 upgrade=true upgrade_ask=false \
-                 relaunch=true human_grace_s=120",
-            )
-            .unwrap(),
-            holder: "grok-alab@9".to_string(),
-        }
-    }
-
-    fn by_aterm(read: AtermRead) -> Facts {
+    fn by_aterm(word: Result<(), String>) -> Facts {
         let mut f = quiet_facts();
         // aterm's read replaces the terminal's input quiet: a terminal typed into a moment ago
         // (aterm's own continuation, say) does not hold it, aterm's human_ms does.
@@ -294,7 +191,7 @@ mod tests {
             input: Duration::ZERO,
             output: Duration::from_secs(600),
         });
-        f.witness = Witness::Aterm(Ok(Box::new(read)));
+        f.witness = Witness::Aterm(word);
         f
     }
 
@@ -364,114 +261,38 @@ mod tests {
     }
 
     #[test]
-    fn aterms_read_moves_a_quiet_session_with_no_signal() {
-        assert_eq!(decide(&by_aterm(quiet_read())), Decision::Move);
-        let mut r = quiet_read();
-        r.screen.composer = Some("placeholder".to_string());
-        r.screen.human = Human::Ago(Duration::from_secs(120));
+    fn aterms_read_moves_a_quiet_session_with_no_signal_and_its_hold_holds() {
+        assert_eq!(decide(&by_aterm(Ok(()))), Decision::Move);
         assert_eq!(
-            decide(&by_aterm(r)),
-            Decision::Move,
-            "the boundary itself is quiet enough"
+            held(&by_aterm(Err("wait aterm agent=unknown".to_string()))),
+            "wait aterm agent=unknown"
         );
-    }
-
-    #[test]
-    fn every_condition_of_aterms_read_holds_the_move_on_its_own() {
-        type Spoil = Box<dyn Fn(&mut AtermRead)>;
-        let cases: Vec<(&str, Spoil)> = vec![
-            ("claim", Box::new(|r| r.screen.proven = false)),
-            (
-                "claim",
-                Box::new(|r| r.screen.supervisor = Some("codex-alab@9".to_string())),
-            ),
-            ("claim", Box::new(|r| r.holder = "grok-alab@10".to_string())),
-            ("policy is off", Box::new(|r| r.policy.effective = false)),
-            (
-                "upgrade = false",
-                Box::new(|r| r.policy.upgrade = Some(false)),
-            ),
-            ("no upgrade switch", Box::new(|r| r.policy.upgrade = None)),
-            (
-                "upgrade_ask = true",
-                Box::new(|r| r.policy.upgrade_ask = Some(true)),
-            ),
-            ("no upgrade_ask", Box::new(|r| r.policy.upgrade_ask = None)),
-            (
-                "agent=busy",
-                Box::new(|r| r.screen.agent = Some("busy".to_string())),
-            ),
-            (
-                "agent=prompt",
-                Box::new(|r| r.screen.agent = Some("prompt".to_string())),
-            ),
-            (
-                "agent=unknown",
-                Box::new(|r| r.screen.agent = Some("unknown".to_string())),
-            ),
-            (
-                "agent=wall:usage",
-                Box::new(|r| r.screen.agent = Some("wall:usage".to_string())),
-            ),
-            ("agent=absent", Box::new(|r| r.screen.agent = None)),
-            (
-                "composer=draft",
-                Box::new(|r| r.screen.composer = Some("draft".to_string())),
-            ),
-            (
-                "composer=-",
-                Box::new(|r| r.screen.composer = Some("-".to_string())),
-            ),
-            ("no composer=", Box::new(|r| r.screen.composer = None)),
-            (
-                "typed 119999 ms ago",
-                Box::new(|r| r.screen.human = Human::Ago(Duration::from_millis(119_999))),
-            ),
-            ("no human_ms", Box::new(|r| r.screen.human = Human::Unknown)),
-            (
-                "typed 89000 ms ago (the grace is 90000",
-                Box::new(|r| {
-                    r.policy.human_grace = Some(Duration::from_secs(90));
-                    r.screen.human = Human::Ago(Duration::from_secs(89));
-                }),
-            ),
-            (
-                "hand=turn:7",
-                Box::new(|r| r.screen.hand = Some("turn:7".to_string())),
-            ),
-            (
-                "hold=1",
-                Box::new(|r| r.screen.hold = Some("1".to_string())),
-            ),
-            (
-                "input=typeahead",
-                Box::new(|r| r.screen.input = Some("typeahead".to_string())),
-            ),
-            (
-                "need=now",
-                Box::new(|r| r.screen.need = Some("now".to_string())),
-            ),
-            ("need=absent", Box::new(|r| r.screen.need = None)),
-        ];
-        for (word, spoil) in cases {
-            let mut r = quiet_read();
-            spoil(&mut r);
-            let why = held(&by_aterm(r));
-            assert!(why.contains(word), "{word}: {why}");
-        }
-        let mut f = by_aterm(quiet_read());
-        f.witness = Witness::Aterm(Err("aterm closed the connection".to_string()));
-        assert!(held(&f).contains("no read of aterm"));
         // The local gates still stand under aterm's read.
-        let mut f = by_aterm(quiet_read());
+        let mut f = by_aterm(Ok(()));
         f.descendants = Some(1);
         assert!(held(&f).contains("1 process"));
-        let mut f = by_aterm(quiet_read());
+        let mut f = by_aterm(Ok(()));
         f.tty = Some(TtyQuiet {
             input: Duration::ZERO,
             output: Duration::from_secs(1),
         });
         assert!(held(&f).contains("wrote to the terminal"));
+    }
+
+    /// A person's request under a claim: aterm's word on it holds the move after the terminal's
+    /// input quiet, and a request that fails the local gates is refused for those first.
+    #[test]
+    fn aterms_word_on_a_request_holds_it_after_the_local_gates() {
+        let mut f = quiet_facts();
+        f.witness = Witness::Request(Err("aterm hold=1".to_string()));
+        assert_eq!(held(&f), "aterm hold=1");
+        f.tty = Some(TtyQuiet {
+            input: Duration::from_secs(1),
+            output: Duration::from_secs(600),
+        });
+        assert!(held(&f).contains("someone typed"), "{f:?}");
+        f.descendants = Some(1);
+        assert!(held(&f).contains("1 process"), "{f:?}");
     }
 
     #[test]

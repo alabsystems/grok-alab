@@ -259,6 +259,39 @@ impl Carried {
         out.extend(resume_argv(&self.session));
         out
     }
+
+    /// This session started on `model`: every model option the launch kept (`-m <M>`,
+    /// `--model <M>`, `--model=<M>`) dropped and `--model=<model>` kept after the rest, for a
+    /// restart aterm asked to make on another model (`restart cause=… model=<word>`). Grok
+    /// Build 1.0.70 takes `-m, --model <MODEL>` (its `--help`, [`FLAGS`]). The kept options are
+    /// walked by the option table, so a value that reads like `-m` (another option's argument)
+    /// is never taken for the model option. `alab-wire` hands over only a model word aterm
+    /// itself would put on a command line, never one starting `-`, and the attached form keeps
+    /// it one token whatever it holds.
+    #[must_use]
+    pub fn with_model(&self, model: &str) -> Carried {
+        let mut kept = Vec::with_capacity(self.kept.len() + 1);
+        let mut words = self.kept.iter().peekable();
+        while let Some(tok) = words.next() {
+            let (name, attached) = option_name(tok);
+            let value = match (flag(name), attached) {
+                (Some((Arity::One, _)), None) => words.next(),
+                (Some((Arity::Optional, _)), None) => words.next_if(|v| !v.starts_with('-')),
+                _ => None,
+            };
+            if name == "-m" || name == "--model" {
+                continue;
+            }
+            kept.push(tok.clone());
+            kept.extend(value.cloned());
+        }
+        kept.push(format!("--model={model}"));
+        Carried {
+            session: self.session.clone(),
+            kept,
+            injected: self.injected.clone(),
+        }
+    }
 }
 
 /// The pair that resumes session `id` of Grok Build (aterm `relaunch::resume_argv`,

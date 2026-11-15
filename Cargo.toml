@@ -1,8 +1,11 @@
 [workspace]
 resolver = "3"
+# The pinned alab-harness copy (vendor/alab-harness) is its own workspace, never a member of
+# this one.
+exclude = ["vendor"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates"]
@@ -11,6 +14,42 @@ authors = ["Andrew Yates"]
 # `bin/grok-alab`). Never `grok`: that name is the vendor row's own shim.
 [workspace.metadata.atpkg]
 expose = ["grok-alab"]
+
+# What a package of main is held to before aterm's tip lane (`atpkg-publish lane run tip`)
+# stages it: the format, lint and test steps of this repository's release gate
+# (publish/config.sh), then the pack itself, then the packed binary's version line. The
+# version word is the harness's only command of its own: every other word runs Grok Build,
+# which on a machine with no Grok sign-in starts one. Each step passes only if it exits 0
+# within `within-secs`.
+[[workspace.metadata.atpkg.qualify]]
+name = "fmt"
+stage = "source"
+run = ["targo", "fmt", "--check"]
+within-secs = 600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "tippy"
+stage = "source"
+run = ["targo", "tippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "test"
+stage = "source"
+run = ["targo", "--unverified", "test", "--locked", "--workspace"]
+within-secs = 3600
+min-tests = 120
+
+[[workspace.metadata.atpkg.qualify]]
+name = "build"
+stage = "build"
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "version"
+stage = "packed"
+run = ["{bin}/grok-alab", "--version"]
+within-secs = 120
 
 [package]
 name = "grok-alab"
@@ -43,6 +82,17 @@ rustix = { version = "1.1.5", features = ["termios", "process"] }
 # verified lane refuses, and std::env::home_dir reads the password database only when HOME is
 # unset or empty (a relative HOME it hands back as it is).
 nix = { version = "0.31.3", default-features = false, features = ["user"] }
+# The aterm client every ALab harness shares (alab-harness `crates/alab-wire`): the wire, the
+# claim at contract 4 or 3 with its guards, the link held, lost and claimed again, aterm's
+# safe-point and relaunch judgements, and the crash ladder (src/aterm.rs, Decision 43). The crate
+# is the vendored alab-harness v0.1.0 copy at vendor/alab-harness, pinned by its git tree id in
+# vendor/alab-harness.pin (alab-harness tools/pin; re-pin to move, Decision 57).
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
+
+[dev-dependencies]
+# alab-wire's fake aterm control socket, which the integration tests run the harness against:
+# the same vendored, pinned v0.1.0 copy.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire", features = ["fake"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

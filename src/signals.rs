@@ -110,15 +110,31 @@ impl Signals {
     /// Wait up to `timeout` for signals and return those that arrived, in order.
     #[must_use]
     pub fn wait(&self, timeout: Duration) -> Vec<libc::c_int> {
+        self.wait_also(timeout, None)
+    }
+
+    /// [`Signals::wait`], also waking as soon as `also` is readable (aterm's event stream, so a
+    /// `harness-policy` or `restart` event is read at once rather than at the next tick). Only
+    /// the signals are returned; `also` is the caller's to read.
+    #[must_use]
+    pub fn wait_also(&self, timeout: Duration, also: Option<RawFd>) -> Vec<libc::c_int> {
         let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-        let mut pfd = libc::pollfd {
-            fd: self.read.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live `pollfd`, count 1. EINTR simply returns early.
+        let mut pfds = [
+            libc::pollfd {
+                fd: self.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: also.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two live `pollfd`s, count 2; a negative descriptor is skipped by `poll`.
+        // EINTR simply returns early.
         unsafe {
-            libc::poll(&raw mut pfd, 1, ms);
+            libc::poll(pfds.as_mut_ptr(), 2, ms);
         }
         self.drain()
     }

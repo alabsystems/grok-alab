@@ -6,21 +6,23 @@
 //! It runs xAI's UNMODIFIED `grok`, the build aterm's package manager installed and verified,
 //! as its child on the inherited terminal, with every argument passed through. It never
 //! ships, forks or patches vendor bytes, never finds the vendor on `PATH`, and its own
-//! version is independent of the vendor's (`grok-alab 0.3.0 (grok 1.0.70)`).
+//! version is independent of the vendor's (`grok-alab 0.4.0 (grok 1.0.70)`).
 //!
 //! While it runs, atpkg may install a newer grok. At a safe point ([`safepoint`]) the harness
 //! ends the child and relaunches it on the new build with the vendor's resume argv
 //! ([`lanes`]), without exiting itself. When the session really ends, it ends with the
 //! child's own status.
 //!
-//! Under aterm it holds the session under aterm's harness contract 3 ([`aterm`]): it claims
-//! `relaunch,upgrade`, follows aterm's harness policy on its event (giving the claim back while
-//! it is off), relaunches a crashed child on the same session on a fresh read of aterm, and
-//! takes the safe point from aterm's read of the screen, a read that cannot pass on today's
-//! aterm (it reports `agent=unknown` for every Grok session), so moves there still wait for
-//! `SIGUSR1`. It never starts a grok that would start signed out itself ([`credentials`]).
-//! Where aterm does not serve contract 3, or refuses the claim, it execs grok in its own place
-//! and is gone ([`run`]).
+//! Under aterm it holds the session through `alab-wire`, the aterm client every ALab harness
+//! shares ([`aterm`]): it claims `relaunch,upgrade` at aterm's harness contract 4 (or 3 where
+//! aterm serves no 4), names each child it starts (`child=<pid>:<start>`), follows aterm's
+//! harness policy on its event (giving the claim back while it is off), relaunches a crashed
+//! child on the same session on aterm's word and back-off, makes the restarts aterm asks for
+//! (`restart cause=asked|stall`, on another model when it names one), and takes the safe point
+//! from aterm's read of the screen, a read that cannot pass on today's aterm (it reports
+//! `agent=unknown` for every Grok session), so moves there still wait for `SIGUSR1`. It never
+//! starts a grok that would start signed out itself ([`credentials`]). Where aterm refuses the
+//! claim, it execs grok in its own place and is gone ([`run`]).
 //!
 //! Its command line is `grok-alab --version`, and `grok-alab run [--] [grok arguments…]` (what
 //! aterm's `grok` twin runs); `grok-alab [grok arguments…]` is `run` too. Arguments after `run`
@@ -351,25 +353,13 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
             return exit_status(signin::EXIT_SIGNED_OUT);
         }
     }
-    let claim = if aterm::under_aterm(env) {
-        match under_aterm(env, &plan, &build) {
-            Ok(claim) => {
-                journal.line(
-                    "CLAIMED",
-                    &format!(
-                        "{} holds the session under aterm contract {}, scope={} (aterm {})",
-                        claim.holder,
-                        aterm::REQUIRED_CONTRACT,
-                        aterm::SCOPE,
-                        claim.conn.version
-                    ),
-                );
-                Some(claim)
-            }
+    let link = if aterm::hosted(env) {
+        match under_aterm(env, &plan, &build, &journal) {
+            Ok(link) => link,
             Err(why) => return pass_through(&layout, &build, &args, depth, &journal, &why),
         }
     } else {
-        None
+        alab_wire::Link::absent(aterm::config(), std::process::id())
     };
     let timing = supervise::Timing::from_env(env, &journal);
     let signals = match signals::Signals::install() {
@@ -388,13 +378,19 @@ pub fn run(args: Vec<OsString>, env: &Env) -> libc::c_int {
         timing,
         signals: &signals,
         depth,
-        claim,
+        link,
     })
 }
 
-/// Under aterm: the start sequence of aterm's harness design §3.2, to a proven claim or the
-/// reason to pass through. The person's `ATERM_NO_HARNESS=1` and a launch the harness cannot
-/// carry pass through without a word to aterm.
+/// Under aterm: the launch's claim, made through `alab-wire` before grok starts (aterm's
+/// harness design §3.2), to a link grok then runs under, or the reason to pass through. The
+/// person's `ATERM_NO_HARNESS=1` and a launch the harness cannot carry pass through without a
+/// word to aterm. A claim aterm refused (a refused or unproven claim, an unrostered harness
+/// under contract 3, a policy off by a fact of the window), and one granted less than both of
+/// [`aterm::SCOPES`] (released first, Decision 44), pass through. A claim aterm could not make
+/// now (it answered later or late, it serves no contract this harness speaks, its policy is
+/// switched off) keeps grok the harness's child, unclaimed, and the claim is made again every
+/// 5 s (Decisions 35, 45). The link's notes are journaled.
 ///
 /// # Errors
 /// Why the harness gets out of the way.
@@ -402,7 +398,8 @@ pub fn under_aterm(
     env: &Env,
     plan: &lanes::Plan,
     build: &store::Build,
-) -> Result<Box<aterm::Claimed>, String> {
+    journal: &journal::Journal,
+) -> Result<alab_wire::Link, String> {
     if aterm::left_out(env) {
         return Err(format!(
             "{}=1 leaves the harness out",
@@ -418,17 +415,37 @@ pub fn under_aterm(
             return Err(format!("not an interactive session: {why}"));
         }
     }
-    let locator = aterm::Locator::from_env(env)?;
-    match aterm::start(
-        &locator,
+    let mut link = alab_wire::Link::launch_with(
+        aterm::config(),
         std::process::id(),
-        VERSION,
-        build.version.as_deref(),
-        aterm::TIMEOUT,
-    ) {
-        aterm::Start::Claimed(c) => Ok(c),
-        aterm::Start::PassThrough(why) => Err(why),
+        aterm::child(build.version.as_deref(), None),
+        aterm::now_ms(),
+        aterm::lookup(env),
+    );
+    let last = aterm::journal(&mut link, journal);
+    if link.is_absent() {
+        return Err(format!(
+            "aterm did not take the claim ({})",
+            last.as_deref().unwrap_or("no session to claim")
+        ));
     }
+    if link.judges() && !aterm::takes_both(&link) {
+        let granted = aterm::granted(&link);
+        link.release(aterm::now_ms());
+        return Err(format!(
+            "aterm granted scope={granted}; the claim needs relaunch,upgrade, so it was given back"
+        ));
+    }
+    if link.is_lost() {
+        journal.line(
+            "NOTE",
+            &format!(
+                "grok runs as the harness's child, unclaimed; the claim is made again every {} s",
+                alab_wire::link::RECLAIM_EVERY_MS / 1000
+            ),
+        );
+    }
+    Ok(link)
 }
 
 /// Exec grok in this process's place with the launch's own arguments and the build's shim
